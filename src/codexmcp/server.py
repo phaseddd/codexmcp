@@ -41,9 +41,9 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     codex_path = shutil.which('codex') or cmd[0]
     popen_cmd[0] = codex_path
 
-    if os.name == "nt" and codex_path.lower().endswith((".cmd", ".bat")):
-        from subprocess import list2cmdline
-        popen_cmd = ["cmd.exe", "/s", "/c", list2cmdline(cmd)]
+    # if os.name == "nt" and codex_path.lower().endswith((".cmd", ".bat")):
+    #     from subprocess import list2cmdline
+    #     popen_cmd = ["cmd.exe", "/s", "/c", list2cmdline(cmd)]
 
     process = subprocess.Popen(
         popen_cmd,
@@ -83,7 +83,28 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
             yield output_queue.get_nowait()
         except queue.Empty:
             break
-
+def windows_escape(prompt):
+    """
+    Windows 风格的字符串转义函数。
+    把常见特殊字符转义成 \\ 形式，适合命令行、JSON 或路径使用。
+    比如：\n 变成 \\n，" 变成 \\"。
+    """
+    # 先处理反斜杠，避免它干扰其他替换
+    result = prompt.replace('\\', '\\\\')
+    # 双引号，转义成 \"，防止字符串边界乱套
+    result = result.replace('"', '\\"')
+    # 换行符，Windows 常用 \r\n，但我们分开转义
+    result = result.replace('\n', '\\n')
+    result = result.replace('\r', '\\r')
+    # 制表符，空格的“超级版”
+    result = result.replace('\t', '\\t')
+    # 其他常见：退格符（像按了后退键）、换页符（打印机跳页用）
+    result = result.replace('\b', '\\b')
+    result = result.replace('\f', '\\f')
+    # 如果有单引号，也转义下（不过 Windows 命令行不那么严格，但保险起见）
+    result = result.replace("'", "\\'")
+    
+    return result
 
 @mcp.tool(
     name="codex",
@@ -137,8 +158,8 @@ async def codex(
 
     if SESSION_ID is not None:
         cmd.extend(["resume", str(SESSION_ID)])
-        
-    cmd += ['--', PROMPT]
+    PROMPT = PROMPT
+    cmd += ['--', windows_escape(PROMPT)]
 
     all_messages: list[Dict[str, Any]] = []
     agent_messages = ""
@@ -179,6 +200,7 @@ async def codex(
             "success": True,
             "SESSION_ID": thread_id,
             "agent_messages": agent_messages,
+            # "PROMPT": PROMPT,
         }
         if return_all_messages:
             result["all_messages"] = all_messages
