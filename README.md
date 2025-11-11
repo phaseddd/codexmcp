@@ -91,6 +91,9 @@ claude mcp list
 > 如果看到如下描述，说明安装成功！
 >  `codex: uvx --from git+https://github.com/GuDaStudio/codexmcp.git codexmcp - ✓ Connected` 
 
+**1.4** 可选择默认允许claude code自动与codex交互，在`~/.claude/settings.json`添加 `mcp__codex__codex` allow项
+![](images/image.png)
+
 ### 2. 配置claude code提示词（可选）
 
 为使claude code更好完成与codex的协同工作，我们**极力推荐您在 `~/.claude/CLAUDE.md`中添加以下内容**
