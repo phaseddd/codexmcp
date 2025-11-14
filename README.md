@@ -133,6 +133,10 @@ claude mcp list
   - SESSION_ID (UUID | null): 用于继续之前的会话以与codex进行多轮交互，默认为 None（开启新会话）
   - skip_git_repo_check (boolean): 是否允许在非 Git 仓库中运行，默认 False
   - return_all_messages (boolean): 是否返回所有消息（包括推理、工具调用等），默认 False
+  - image (List[Path] | null): 附加一个或多个图片文件到初始提示词，默认为 None
+  - model (string | null): 指定使用的模型，默认为 None（使用用户默认配置）
+  - yolo (boolean | null): 无需审批运行所有命令（跳过沙箱），默认 False
+  - profile (string | null): 从 `~/.codex/config.toml` 加载的配置文件名称，默认为 None（使用用户默认配置）
 
   返回值：
   {
@@ -195,6 +199,10 @@ claude mcp list
 | `SESSION_ID` | `UUID \| None` | ❌ | `None` | 会话 ID（None 则开启新会话） |
 | `skip_git_repo_check` | `bool` | ❌ | `False` | 是否允许在非 Git 仓库运行 |
 | `return_all_messages` | `bool` | ❌ | `False` | 是否返回完整推理信息 |
+| `image` | `List[Path] \| None` | ❌ | `None` | 附加图片文件到初始提示词 |
+| `model` | `str \| None` | ❌ | `None` | 指定使用的模型（默认使用用户配置） |
+| `yolo` | `bool \| None` | ❌ | `False` | 无需审批运行所有命令（跳过沙箱） |
+| `profile` | `str \| None` | ❌ | `None` | 从 `~/.codex/config.toml` 加载的配置文件名称 |
 
 </details>
 

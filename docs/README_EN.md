@@ -46,6 +46,25 @@ Please ensure you have successfully **installed** and **configured** both Claude
 - [Claude Code Installation Guide](https://docs.claude.com/docs/claude-code)
 - [Codex CLI Installation Guide](https://developers.openai.com/codex/quickstart)
 
+
+Please ensure you have successfully installed the [uv tool](https://docs.astral.sh/uv/getting-started/installation/):
+
+- Windows
+  Run the following command in PowerShell:
+  ```
+  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+  ```
+
+- Linux/macOS
+  Download and install using curl/wget:
+  ```
+  curl -LsSf https://astral.sh/uv/install.sh | sh # Using curl
+
+  wget -qO- https://astral.sh/uv/install.sh | sh # Using wget
+  ```
+
+**Note: We strongly recommend Windows users run this project in WSL!**
+
 <!-- If you're facing challenges with subscription or configuration, we'd be happy to [assist you](https://cc.guda.studio). -->
 
 ### 1. Installation Steps
@@ -71,6 +90,9 @@ claude mcp list
 > [!IMPORTANT]
 > If you see the following output, installation was successful!
 >  `codex: uvx --from git+https://github.com/GuDaStudio/codexmcp.git codexmcp - ✓ Connected`
+
+**1.4** Optionally allow Claude Code to automatically interact with Codex by adding `mcp__codex__codex` to the allow list in `~/.claude/settings.json`
+![](../images/image.png)
 
 ### 2. Configure Claude Code Prompts (Optional)
 
@@ -111,6 +133,10 @@ You **must execute** the following steps:
   - SESSION_ID (UUID | null): For continuing previous sessions to enable multi-turn interactions with Codex, defaults to None (start new session)
   - skip_git_repo_check (boolean): Whether to allow running in non-Git repositories, defaults to False
   - return_all_messages (boolean): Whether to return all messages (including reasoning, tool calls, etc.), defaults to False
+  - image (List[Path] | null): Attach one or more image files to the initial prompt, defaults to None
+  - model (string | null): Specify the model to use, defaults to None (uses user's default configuration)
+  - yolo (boolean | null): Run all commands without approval (skip sandboxing), defaults to False
+  - profile (string | null): Configuration profile name to load from `~/.codex/config.toml`, defaults to None (uses user's default configuration)
 
   Return value:
   {
@@ -173,6 +199,10 @@ You **must execute** the following steps:
 | `SESSION_ID` | `UUID \| None` | ❌ | `None` | Session ID (None starts new session) |
 | `skip_git_repo_check` | `bool` | ❌ | `False` | Whether to allow running in non-Git repositories |
 | `return_all_messages` | `bool` | ❌ | `False` | Whether to return complete reasoning information |
+| `image` | `List[Path] \| None` | ❌ | `None` | Attach image files to initial prompt |
+| `model` | `str \| None` | ❌ | `None` | Specify model to use (defaults to user configuration) |
+| `yolo` | `bool \| None` | ❌ | `False` | Run all commands without approval (skip sandboxing) |
+| `profile` | `str \| None` | ❌ | `None` | Configuration profile name from `~/.codex/config.toml` |
 
 </details>
 
@@ -255,7 +285,8 @@ Copyright (c) 2025 [guda.studio](mailto:gudaclaude@gmail.com)
 
 ---
 <div align="center">
-Support us with a 🌟~
 
+## Support us with a 🌟~
 [![Star History Chart](https://api.star-history.com/svg?repos=GuDaStudio/codexmcp&type=date&legend=top-left)](https://www.star-history.com/#GuDaStudio/codexmcp&type=date&legend=top-left)
+
 </div>
