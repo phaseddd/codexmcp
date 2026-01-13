@@ -240,8 +240,8 @@ async def codex(
                 err_message += "\n\n[codex error] " + line_dict.get("error", {}).get("message", "")
             if "error" in line_dict.get("type", ""):
                 error_msg = line_dict.get("message", "")
-                import re 
-                is_reconnecting = bool(re.match(r'^Reconnecting\.\.\.\s+\d+/\d+$', error_msg))
+                import re
+                is_reconnecting = bool(re.match(r'^Reconnecting\.\.\.\s+\d+/\d+', error_msg))
                 
                 if not is_reconnecting:
                     success = False if len(agent_messages) == 0 else success
