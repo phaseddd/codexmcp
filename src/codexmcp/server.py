@@ -26,6 +26,58 @@ def _empty_str_to_none(value: str | None) -> str | None:
     return value
 
 
+def _build_popen_cmd(cmd: list[str]) -> list[str]:
+    """Build the popen command list, resolving codex path for the current platform.
+
+    On Windows, npm global packages create .ps1 and .cmd shims. This function
+    resolves the execution strategy with the following preference order:
+        1. pwsh       + codex.ps1  (PowerShell 7)
+        2. powershell + codex.ps1  (Windows PowerShell 5.1)
+        3. codex.cmd               (direct execution via CreateProcessW)
+
+    On Unix/macOS, simply resolves via shutil.which() and executes directly.
+
+    Note: We use -NoLogo instead of -NoProfile to preserve user's Profile settings
+    (e.g., UTF-8 encoding via [Console]::OutputEncoding, proxy settings, etc.).
+    Using -NoProfile would cause these configurations to be skipped, potentially
+    leading to GBK encoding issues on Chinese Windows systems.
+
+    Args:
+        cmd: Original command list (e.g., ["codex", "exec", ...])
+
+    Returns:
+        The resolved command list ready for subprocess.Popen(shell=False)
+    """
+    popen_cmd = cmd.copy()
+    codex_path = shutil.which('codex') or cmd[0]
+
+    if os.name != 'nt':
+        # Unix/macOS: direct execution, no changes needed
+        popen_cmd[0] = codex_path
+        return popen_cmd
+
+    # --- Windows: resolve shell preference ---
+    base, ext = os.path.splitext(codex_path)
+    ext_lower = ext.lower()
+
+    # Step 1: Try .ps1 + PowerShell (preferred path)
+    ps1_path = codex_path if ext_lower == '.ps1' else base + '.ps1'
+    if os.path.isfile(ps1_path):
+        ps_shell = shutil.which('pwsh') or shutil.which('powershell')
+        if ps_shell:
+            return [ps_shell, '-NoLogo', '-File', ps1_path] + cmd[1:]
+
+    # Step 2: Fall back to .cmd (CreateProcessW handles it natively)
+    cmd_path = codex_path if ext_lower == '.cmd' else base + '.cmd'
+    if os.path.isfile(cmd_path):
+        popen_cmd[0] = cmd_path
+        return popen_cmd
+
+    # Step 3: Last resort — use whatever shutil.which found
+    popen_cmd[0] = codex_path
+    return popen_cmd
+
+
 def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     """Execute a command and stream its output line-by-line.
 
@@ -35,11 +87,9 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     Yields:
         Output lines from the command
     """
-    # On Windows, codex is exposed via a *.cmd shim. Use cmd.exe with /s so
-    # user prompts containing quotes/newlines aren't reinterpreted as shell syntax.
-    popen_cmd = cmd.copy()
-    codex_path = shutil.which('codex') or cmd[0]
-    popen_cmd[0] = codex_path
+    # Build the actual command, handling Windows .ps1/.cmd shim resolution
+    # with shell preference: pwsh > powershell > cmd
+    popen_cmd = _build_popen_cmd(cmd)
 
     process = subprocess.Popen(
         popen_cmd,
