@@ -1,6 +1,9 @@
 # Project-specific
 codexmcp-doc/
 *CLAUDE.md
+_temp_commands/
+_temp_skills/
+record-analysis/
 
 # Python
 __pycache__/
