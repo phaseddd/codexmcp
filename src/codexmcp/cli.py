@@ -1,10 +1,10 @@
-"""Console entry point for the Codex MCP server."""
+"""CodexMCP 服务器的控制台入口点。"""
 
 from codexmcp.server import run
 
 
 def main() -> None:
-    """Start the Codex MCP server."""
+    """启动 CodexMCP 服务器。"""
     run()
 
 
