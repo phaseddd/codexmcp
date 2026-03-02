@@ -4,6 +4,8 @@ codexmcp-doc/
 _temp_commands/
 _temp_skills/
 record-analysis/
+examples/results/*
+!examples/results/.gitkeep
 
 # Python
 __pycache__/
