@@ -142,7 +142,6 @@ async def codex(
     yolo: bool = False,
     return_all_messages: bool = False,
     image: list[Path] = [],
-    profile: str = "",
 ) -> Dict[str, Any]:
     """阻塞模式：发送 prompt，等待 turn 完成，返回聚合结果。
 
@@ -290,6 +289,7 @@ async def codex_start(
     SESSION_ID: str = "",
     model: str = "",
     yolo: bool = False,
+    image: list[Path] = [],
 ) -> Dict[str, Any]:
     """非阻塞模式：启动 Codex 任务，立即返回 thread_id。"""
     bridge = get_bridge()
@@ -329,6 +329,7 @@ async def codex_start(
         # 发送 turn（不等待完成）
         turn_params = _build_turn_params(
             thread_id, PROMPT, sandbox,
+            images=image if image else None,
             model=model,
             yolo=yolo,
         )
