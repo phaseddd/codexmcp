@@ -6,6 +6,7 @@ _temp_skills/
 record-analysis/
 examples/results/*
 !examples/results/.gitkeep
+tmp/
 
 # Python
 __pycache__/

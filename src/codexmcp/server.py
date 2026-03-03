@@ -1,385 +1,520 @@
-"""CodexMCP 的 FastMCP 服务器实现。
+"""CodexMCP 的 FastMCP 服务器实现（v2 — app-server 架构）。
 
-通过 MCP 协议桥接 Claude Code 和 Codex CLI，
-封装 `codex exec` 命令，提供会话管理、多轮对话和 JSON 流式输出能力。
+通过 MCP 协议桥接 Claude Code 和 Codex App Server v2 API，
+提供阻塞模式、轮询模式、中断和审批能力。
+
+5 个 MCP 工具：
+- codex       — 阻塞模式（向后兼容），等待 turn 完成后返回聚合结果
+- codex_start — 非阻塞模式，启动后立即返回 thread_id
+- codex_status — 增量查询，按 cursor 返回新事件
+- codex_interrupt — 中断正在进行的 turn
+- codex_approve — 响应审批请求（批准/拒绝）
 """
 
 from __future__ import annotations
 
-import json
+import asyncio
+import logging
 import os
-import queue
-import re
-import subprocess
-import threading
+import sys
 import time
-import uuid
 from pathlib import Path
-from typing import Annotated, Any, Dict, Generator, List, Literal, Optional
+from typing import Any, Dict, Literal
+from uuid import uuid4
 
-from mcp.server.fastmcp import FastMCP
-from pydantic import BeforeValidator, Field
-import shutil
+from mcp.server.fastmcp import Context, FastMCP
+
+from codexmcp.bridge import get_bridge
+from codexmcp.compat import escape_prompt
+from codexmcp.errors import TURN_TOTAL_TIMEOUT
+
+logger = logging.getLogger(__name__)
 
 # 初始化 FastMCP 服务器实例
-mcp = FastMCP("Codex MCP Server-from guda.studio")
+mcp = FastMCP("Codex MCP Server-from phaseddd")
 
 
-def _empty_str_to_none(value: str | None) -> str | None:
-    """将空字符串转换为 None，用于可选的 UUID 参数。"""
-    if isinstance(value, str) and not value.strip():
-        return None
-    return value
+# === 协议格式辅助函数 ===
+
+# sandboxPolicy 字符串到 v2 协议对象的映射
+_SANDBOX_POLICY_MAP: Dict[str, Dict[str, str]] = {
+    "read-only": {"type": "readOnly"},
+    "workspace-write": {"type": "workspaceWrite"},
+    "danger-full-access": {"type": "dangerFullAccess"},
+}
 
 
-def _build_popen_cmd(cmd: list[str]) -> list[str]:
-    """构建子进程命令列表，根据当前平台解析 codex 可执行文件路径。
+def _build_user_input(prompt: str, images: list[Path] | None = None) -> list[Dict[str, Any]]:
+    """将 prompt 字符串和可选图片列表转换为 v2 协议的 UserInput 数组。
 
-    在 Windows 上，npm 全局安装的包会生成 .ps1 和 .cmd 两种 shim 脚本。
-    本函数按以下优先级解析执行策略：
-        1. pwsh       + codex.ps1  （PowerShell 7，推荐）
-        2. powershell + codex.ps1  （Windows PowerShell 5.1）
-        3. codex.cmd               （通过 CreateProcessW 直接执行）
-
-    在 Unix/macOS 上，直接通过 shutil.which() 解析路径并执行。
-
-    注意：使用 -NoLogo 而非 -NoProfile，以保留用户的 Profile 配置
-    （如 UTF-8 编码设置 [Console]::OutputEncoding、代理设置等）。
-    使用 -NoProfile 会跳过这些配置，可能导致中文 Windows 系统出现 GBK 编码问题。
+    v2 协议要求 turn/start 的 input 字段为 UserInput 对象数组，
+    每个对象需要 type 字段标识类型。
 
     Args:
-        cmd: 原始命令列表（如 ["codex", "exec", ...]）
+        prompt: 用户输入的文本 prompt
+        images: 可选的本地图片路径列表
 
     Returns:
-        解析后可直接传给 subprocess.Popen(shell=False) 的命令列表
+        符合 v2 协议的 UserInput 数组
     """
-    popen_cmd = cmd.copy()
-    codex_path = shutil.which('codex') or cmd[0]
-
-    if os.name != 'nt':
-        # Unix/macOS：直接执行，无需额外处理
-        popen_cmd[0] = codex_path
-        return popen_cmd
-
-    # --- Windows：按优先级解析 shell ---
-    base, ext = os.path.splitext(codex_path)
-    ext_lower = ext.lower()
-
-    # 第 1 步：尝试 .ps1 + PowerShell（首选路径）
-    ps1_path = codex_path if ext_lower == '.ps1' else base + '.ps1'
-    if os.path.isfile(ps1_path):
-        ps_shell = shutil.which('pwsh') or shutil.which('powershell')
-        if ps_shell:
-            return [ps_shell, '-NoLogo', '-File', ps1_path] + cmd[1:]
-
-    # 第 2 步：回退到 .cmd（Windows 原生 CreateProcessW 可直接处理）
-    cmd_path = codex_path if ext_lower == '.cmd' else base + '.cmd'
-    if os.path.isfile(cmd_path):
-        popen_cmd[0] = cmd_path
-        return popen_cmd
-
-    # 第 3 步：兜底方案 — 使用 shutil.which 找到的任何路径
-    popen_cmd[0] = codex_path
-    return popen_cmd
+    items: list[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if images:
+        for img in images:
+            items.append({"type": "localImage", "path": str(img)})
+    return items
 
 
-def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
-    """执行命令并逐行流式输出结果。
+def _build_turn_params(
+    thread_id: str,
+    prompt: str,
+    sandbox: str,
+    *,
+    images: list[Path] | None = None,
+    model: str = "",
+    yolo: bool = False,
+) -> Dict[str, Any]:
+    """构建 turn/start 的请求参数。
 
-    通过独立线程读取子进程的 stdout，放入线程安全队列，
-    主线程从队列中消费并 yield 每一行输出。
-    当检测到 Codex 输出 `turn.completed` 类型的 JSON 时，
-    延迟 0.3 秒后优雅终止子进程。
+    将 MCP 工具的用户友好参数转换为 v2 协议的精确格式。
 
     Args:
-        cmd: 命令及参数列表（如 ["codex", "exec", "prompt"]）
-
-    Yields:
-        命令输出的每一行文本
-    """
-    # 构建实际执行命令，处理 Windows 上 .ps1/.cmd shim 的解析
-    # shell 优先级：pwsh > powershell > cmd
-    popen_cmd = _build_popen_cmd(cmd)
-
-    # 创建子进程，禁用 shell=True 防止命令注入
-    process = subprocess.Popen(
-        popen_cmd,
-        shell=False,
-        stdin=subprocess.DEVNULL,      # 不接受标准输入
-        stdout=subprocess.PIPE,        # 捕获标准输出
-        stderr=subprocess.STDOUT,      # 将标准错误合并到标准输出
-        universal_newlines=True,
-        encoding='utf-8',
-    )
-
-    # 线程安全的输出队列，None 作为结束信号
-    output_queue: queue.Queue[str | None] = queue.Queue()
-    # 检测到 turn.completed 后的优雅关闭延迟（秒）
-    GRACEFUL_SHUTDOWN_DELAY = 0.3
-
-    def is_turn_completed(line: str) -> bool:
-        """通过解析 JSON 检查当前行是否表示回合完成。"""
-        try:
-            data = json.loads(line)
-            return data.get("type") == "turn.completed"
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            return False
-
-    def read_output() -> None:
-        """在独立线程中读取子进程输出，避免阻塞主线程。"""
-        if process.stdout:
-            for line in iter(process.stdout.readline, ""):
-                stripped = line.strip()
-                output_queue.put(stripped)
-                # 检测到回合完成，延迟后终止子进程
-                if is_turn_completed(stripped):
-                    time.sleep(GRACEFUL_SHUTDOWN_DELAY)
-                    process.terminate()
-                    break
-            process.stdout.close()
-        # 发送结束信号
-        output_queue.put(None)
-
-    # 启动输出读取线程
-    thread = threading.Thread(target=read_output)
-    thread.start()
-
-    # 主线程从队列中消费输出行
-    while True:
-        try:
-            line = output_queue.get(timeout=0.5)
-            if line is None:
-                break
-            yield line
-        except queue.Empty:
-            # 队列为空时检查子进程和线程是否都已结束
-            if process.poll() is not None and not thread.is_alive():
-                break
-
-    # 等待子进程结束，超时则强制终止
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-    # 等待读取线程结束
-    thread.join(timeout=5)
-
-    # 清空队列中残余的输出行
-    while not output_queue.empty():
-        try:
-            line = output_queue.get_nowait()
-            if line is not None:
-                yield line
-        except queue.Empty:
-            break
-
-
-def windows_escape(prompt: str) -> str:
-    """Windows 风格的字符串转义函数。
-
-    将常见特殊字符转义成 \\\\ 形式，适合命令行、JSON 或路径场景使用。
-    例如：\\n 变成 \\\\n，" 变成 \\\\"。
-
-    Args:
-        prompt: 需要转义的原始字符串
+        thread_id: 目标 thread ID
+        prompt: 已转义的 prompt 字符串
+        sandbox: 沙箱策略字符串（read-only / workspace-write / danger-full-access）
+        images: 可选的图片列表
+        model: 可选的模型覆盖
+        yolo: 是否启用自动审批
 
     Returns:
-        转义后的安全字符串
+        符合 v2 协议的 turn/start 参数字典
     """
-    # 先处理反斜杠，避免干扰后续替换
-    result = prompt.replace('\\', '\\\\')
-    # 双引号转义，防止字符串边界混乱
-    result = result.replace('"', '\\"')
-    # 换行符（Windows 常用 \\r\\n，分开转义）
-    result = result.replace('\n', '\\n')
-    result = result.replace('\r', '\\r')
-    # 制表符
-    result = result.replace('\t', '\\t')
-    # 退格符和换页符
-    result = result.replace('\b', '\\b')
-    result = result.replace('\f', '\\f')
-    # 单引号（Windows 命令行虽不严格要求，但保险起见也转义）
-    result = result.replace("'", "\\'")
+    params: Dict[str, Any] = {
+        "threadId": thread_id,
+        "input": _build_user_input(prompt, images),
+        "sandboxPolicy": _SANDBOX_POLICY_MAP.get(sandbox, {"type": "readOnly"}),
+    }
 
-    return result
+    # per-turn 模型覆盖
+    if model:
+        params["model"] = model
+
+    # yolo 模式：设置 approvalPolicy 为 "never"，turn 级别跳过所有审批
+    if yolo:
+        params["approvalPolicy"] = "never"
+
+    return params
+
+
+# === MCP 工具定义 ===
 
 
 @mcp.tool(
     name="codex",
     description="""
-    Executes a non-interactive Codex session via CLI to perform AI-assisted coding tasks in a secure workspace.
-    This tool wraps the `codex exec` command, enabling model-driven code generation, debugging, or automation based on natural language prompts.
-    It supports resuming ongoing sessions for continuity and enforces sandbox policies to prevent unsafe operations. Ideal for integrating Codex into MCP servers for agentic workflows, such as code reviews or repo modifications.
+    通过 Codex App Server v2 协议执行 AI 辅助编码任务（阻塞模式）。
 
-    **Key Features:**
-        - **Prompt-Driven Execution:** Send task instructions to Codex for step-by-step code handling.
-        - **Workspace Isolation:** Operate within a specified directory, with optional Git repo skipping.
-        - **Security Controls:** Three sandbox levels balance functionality and safety.
-        - **Session Persistence:** Resume prior conversations via `SESSION_ID` for iterative tasks.
+    发送 prompt 给 Codex，等待任务完成后返回聚合结果。
+    支持会话恢复（通过 SESSION_ID）和沙箱隔离策略。
 
-    **Edge Cases & Best Practices:**
-        - Ensure `cd` exists and is accessible; tool fails silently on invalid paths.
-        - For most repos, prefer "read-only" to avoid accidental changes.
-        - If needed, set `return_all_messages` to `True` to parse "all_messages" for detailed tracing (e.g., reasoning, tool calls, etc.).
+    **核心能力：**
+        - **Prompt 驱动执行：** 向 Codex 发送任务指令，逐步完成编码工作。
+        - **工作区隔离：** 在指定目录内操作，支持三级沙箱安全策略。
+        - **会话持久化：** 通过 SESSION_ID 恢复之前的对话上下文。
+        - **事件聚合：** 自动收集 agent 消息、命令执行、文件变更、推理过程等完整事件流。
+
+    **使用建议：**
+        - 确保 `cd` 路径存在且可访问。
+        - 大多数场景推荐使用 "read-only" 沙箱以避免意外修改。
+        - 设置 `return_all_messages=True` 可获取完整事件摘要（仅 summary，不含原始 params）。
+        - 长时间任务建议使用 codex_start 非阻塞模式。
     """,
-    meta={"version": "0.0.0", "author": "guda.studio"},
+    meta={"version": "2.0.0", "author": "phaseddd"},
 )
 async def codex(
-    PROMPT: Annotated[str, "Instruction for the task to send to codex."],
-    cd: Annotated[Path, "Set the workspace root for codex before executing the task."],
-    sandbox: Annotated[
-        Literal["read-only", "workspace-write", "danger-full-access"],
-        Field(
-            description="Sandbox policy for model-generated commands. Defaults to `read-only`."
-        ),
+    PROMPT: str,
+    cd: Path,
+    ctx: Context,
+    sandbox: Literal[
+        "read-only", "workspace-write", "danger-full-access"
     ] = "read-only",
-    SESSION_ID: Annotated[
-        str,
-        "Resume the specified session of the codex. Defaults to `None`, start a new session.",
-    ] = "",
-    skip_git_repo_check: Annotated[
-        bool,
-        "Allow codex running outside a Git repository (useful for one-off directories).",
-    ] = True,
-    return_all_messages: Annotated[
-        bool,
-        "Return all messages (e.g. reasoning, tool calls, etc.) from the codex session. Set to `False` by default, only the agent's final reply message is returned.",
-    ] = False,
-    image: Annotated[
-        List[Path],
-        Field(
-            description="Attach one or more image files to the initial prompt. Separate multiple paths with commas or repeat the flag.",
-        ),
-    ] = [],
-    model: Annotated[
-        str,
-        Field(
-            description="The model to use for the codex session. This parameter is strictly prohibited unless explicitly specified by the user.",
-        ),
-    ] = "",
-    yolo: Annotated[
-        bool,
-        Field(
-            description="Run every command without approvals or sandboxing. Only use when `sandbox` couldn't be applied.",
-        ),
-    ] = False,
-    profile: Annotated[
-        str,
-        "Configuration profile name to load from `~/.codex/config.toml`. This parameter is strictly prohibited unless explicitly specified by the user.",
-    ] = "",
+    SESSION_ID: str = "",
+    model: str = "",
+    yolo: bool = False,
+    return_all_messages: bool = False,
+    image: list[Path] = [],
+    profile: str = "",
 ) -> Dict[str, Any]:
-    """执行 Codex CLI 会话并返回结果。
+    """阻塞模式：发送 prompt，等待 turn 完成，返回聚合结果。
 
-    构建命令行参数 → 启动子进程 → 逐行解析 JSON 流 → 提取 agent 消息和会话 ID → 返回结构化结果。
+    流程：
+    1. ensure_ready → 确保 app-server 就绪
+    2. 预创建 placeholder collector（防止通知早于响应）
+    3. thread/start 或 thread/resume
+    4. rebind collector 到真实 thread_id
+    5. turn/start 启动任务
+    6. barrier 等待 + 总超时 30min + ctx.report_progress 预埋
+    7. 检查 turn_error → 返回聚合结果
     """
-    # 构建命令列表，避免 shell 注入
-    cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
+    bridge = get_bridge()
+    await bridge.ensure_ready()
 
-    # 附加图片参数
-    if len(image):
-        cmd.extend(["--image", ",".join(str(p) for p in image)])
+    # Windows 平台 prompt 转义
+    PROMPT = escape_prompt(PROMPT)
 
-    # 指定模型（仅在用户明确指定时）
-    if model:
-        cmd.extend(["--model", model])
+    # 1. 预创建 collector（防止通知早于响应到达时丢失）
+    placeholder_id = f"__pending_{uuid4().hex[:8]}"
+    pre_collector = bridge.get_or_create_collector(placeholder_id)
+    pre_collector.auto_approve = yolo  # yolo 模式下自动批准审批请求
 
-    # 指定配置 profile（仅在用户明确指定时）
-    if profile:
-        cmd.extend(["--profile", profile])
+    try:
+        # 2. 创建或恢复 thread
+        if SESSION_ID:
+            thread_result = await bridge.rpc_call(
+                "thread/resume",
+                {
+                    "threadId": SESSION_ID,
+                    "cwd": str(cd),
+                },
+            )
+        else:
+            thread_params: Dict[str, Any] = {"cwd": str(cd)}
+            if model:
+                thread_params["model"] = model
+            thread_result = await bridge.rpc_call("thread/start", thread_params)
 
-    # YOLO 模式：跳过所有审批和沙箱限制
-    if yolo:
-        cmd.append("--yolo")
+        # 3. 将预创建的 collector 绑定到真实 thread_id
+        thread_id = thread_result["thread"]["id"]
+        bridge.rebind_collector(placeholder_id, thread_id)
+        collector = bridge.get_or_create_collector(thread_id)
+        collector.reset_for_new_turn()
+        collector.auto_approve = yolo
 
-    # 跳过 Git 仓库检查（允许在非 Git 目录下运行）
-    if skip_git_repo_check:
-        cmd.append("--skip-git-repo-check")
+        # 4. 发送 turn
+        turn_params = _build_turn_params(
+            thread_id, PROMPT, sandbox,
+            images=image if image else None,
+            model=model,
+            yolo=yolo,
+        )
 
-    # 恢复已有会话
-    if SESSION_ID:
-        cmd.extend(["resume", str(SESSION_ID)])
+        turn_result = await bridge.rpc_call("turn/start", turn_params)
+        collector.current_turn_id = turn_result.get("turn", {}).get("id")
 
-    # Windows 平台需要对 Prompt 中的特殊字符进行转义
-    if os.name == "nt":
-        PROMPT = windows_escape(PROMPT)
-    cmd += ['--', PROMPT]
+        # 5. 等待 turn 完成（Barrier 模式）
+        start_time = time.time()
+        progress_counter = 0
+        while not collector.turn_completed.is_set():
+            # 检查总超时
+            if time.time() - start_time > TURN_TOTAL_TIMEOUT:
+                await bridge.interrupt_turn(thread_id, collector.current_turn_id)
+                return {
+                    "success": False,
+                    "error": f"Turn 执行超时（{TURN_TOTAL_TIMEOUT // 60} 分钟）",
+                    "SESSION_ID": thread_id,
+                    "partial_result": collector.get_aggregated_result(),
+                }
 
-    # 初始化结果收集变量
-    all_messages: list[Dict[str, Any]] = []  # 所有 JSON 消息
-    agent_messages = ""                       # agent 的最终回复文本
-    success = True                            # 执行是否成功
-    err_message = ""                          # 错误信息累积
-    thread_id: Optional[str] = None           # Codex 会话 ID（用于多轮对话）
+            try:
+                await asyncio.wait_for(
+                    collector.turn_completed.wait(), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                # 预埋 progress 报告（当前静默，未来 Claude Code 支持时生效）
+                progress_counter += 1
+                try:
+                    await ctx.report_progress(
+                        progress=progress_counter,
+                        total=0,
+                    )
+                except Exception:
+                    pass  # 静默忽略 progress 报告错误
 
-    # 逐行解析 Codex CLI 的 JSON 流输出
-    for line in run_shell_command(cmd):
-        try:
-            line_dict = json.loads(line.strip())
-            all_messages.append(line_dict)
+        # 6. 检查 turn 错误
+        if collector.turn_error:
+            return {
+                "success": False,
+                "SESSION_ID": thread_id,
+                "error": collector.turn_error.get("message", "Turn 执行失败"),
+                "error_details": collector.turn_error,
+            }
 
-            # 提取 agent 消息文本
-            item = line_dict.get("item", {})
-            item_type = item.get("type", "")
-            if item_type == "agent_message":
-                agent_messages = agent_messages + item.get("text", "")
-
-            # 提取会话 ID（thread_id），用于后续 resume
-            if line_dict.get("thread_id") is not None:
-                thread_id = line_dict.get("thread_id")
-
-            # 处理失败类型的消息
-            if "fail" in line_dict.get("type", ""):
-                success = False if len(agent_messages) == 0 else success
-                err_message += "\n\n[codex error] " + line_dict.get("error", {}).get("message", "")
-
-            # 处理错误类型的消息（过滤掉重连消息）
-            if "error" in line_dict.get("type", ""):
-                error_msg = line_dict.get("message", "")
-                is_reconnecting = bool(re.match(r'^Reconnecting\.\.\.\s+\d+/\d+', error_msg))
-
-                if not is_reconnecting:
-                    success = False if len(agent_messages) == 0 else success
-                    err_message += "\n\n[codex error] " + error_msg
-
-        except json.JSONDecodeError:
-            # 非 JSON 格式的行，记录错误但继续处理
-            err_message += "\n\n[json decode error] " + line
-            continue
-
-        except Exception as error:
-            # 意外异常，记录并中止解析
-            err_message += "\n\n[unexpected error] " + f"Unexpected error: {error}. Line: {line!r}"
-            success = False
-            break
-
-    # 校验必要字段：会话 ID
-    if thread_id is None:
-        success = False
-        err_message = "Failed to get `SESSION_ID` from the codex session. \n\n" + err_message
-
-    # 校验必要字段：agent 回复消息
-    if len(agent_messages) == 0:
-        success = False
-        err_message = "Failed to get `agent_messages` from the codex session. \n\n You can try to set `return_all_messages` to `True` to get the full reasoning information. " + err_message
-
-    # 构建返回结果
-    if success:
+        # 7. 聚合返回
+        aggregated = collector.get_aggregated_result()
         result: Dict[str, Any] = {
             "success": True,
             "SESSION_ID": thread_id,
-            "agent_messages": agent_messages,
+            "agent_messages": aggregated["agent_messages"],
+            "token_usage": aggregated["token_usage"],
         }
-    else:
-        result = {"success": False, "error": err_message}
 
-    # 按需附加完整消息列表（用于调试和追踪）
-    if return_all_messages:
-        result["all_messages"] = all_messages
+        # 可选：返回事件摘要（仅 summary，不含 params，避免撑爆上下文）
+        if return_all_messages:
+            result["events"] = [
+                {"method": e.method, "summary": e.summary}
+                for e in collector.events
+            ]
+            result["command_executions"] = aggregated["command_executions"]
+            result["file_changes"] = aggregated["file_changes"]
+            result["reasoning_segments"] = aggregated["reasoning_segments"]
+
+        if collector.truncated:
+            result["truncated"] = True
+
+        return result
+
+    except Exception as e:
+        # 清理 placeholder（如果还存在）
+        bridge.remove_collector(placeholder_id)
+        logger.error(f"codex 工具执行失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool(
+    name="codex_start",
+    description="""
+    启动非阻塞 Codex 会话，立即返回 thread_id。
+
+    适用于长时间运行的任务，支持增量查看进度。
+    使用 codex_status(thread_id) 轮询进度，
+    使用 codex_interrupt(thread_id) 中断任务，
+    使用 codex_approve(thread_id, request_id) 响应审批请求。
+    """,
+    meta={"version": "2.0.0", "author": "phaseddd"},
+)
+async def codex_start(
+    PROMPT: str,
+    cd: Path,
+    sandbox: Literal[
+        "read-only", "workspace-write", "danger-full-access"
+    ] = "read-only",
+    SESSION_ID: str = "",
+    model: str = "",
+    yolo: bool = False,
+) -> Dict[str, Any]:
+    """非阻塞模式：启动 Codex 任务，立即返回 thread_id。"""
+    bridge = get_bridge()
+    await bridge.ensure_ready()
+
+    # Windows 平台 prompt 转义
+    PROMPT = escape_prompt(PROMPT)
+
+    # 预创建 collector
+    placeholder_id = f"__pending_{uuid4().hex[:8]}"
+    pre_collector = bridge.get_or_create_collector(placeholder_id)
+    pre_collector.auto_approve = yolo
+
+    try:
+        # 创建或恢复 thread
+        if SESSION_ID:
+            thread_result = await bridge.rpc_call(
+                "thread/resume",
+                {
+                    "threadId": SESSION_ID,
+                    "cwd": str(cd),
+                },
+            )
+        else:
+            thread_params: Dict[str, Any] = {"cwd": str(cd)}
+            if model:
+                thread_params["model"] = model
+            thread_result = await bridge.rpc_call("thread/start", thread_params)
+
+        # 绑定到真实 thread_id
+        thread_id = thread_result["thread"]["id"]
+        bridge.rebind_collector(placeholder_id, thread_id)
+        collector = bridge.get_or_create_collector(thread_id)
+        collector.reset_for_new_turn()
+        collector.auto_approve = yolo
+
+        # 发送 turn（不等待完成）
+        turn_params = _build_turn_params(
+            thread_id, PROMPT, sandbox,
+            model=model,
+            yolo=yolo,
+        )
+
+        turn_result = await bridge.rpc_call("turn/start", turn_params)
+        collector.current_turn_id = turn_result.get("turn", {}).get("id")
+
+        return {
+            "success": True,
+            "thread_id": thread_id,
+            "SESSION_ID": thread_id,  # 向后兼容别名
+            "status": "running",
+            "message": "任务已启动。使用 codex_status(thread_id) 查看进度。",
+        }
+
+    except Exception as e:
+        bridge.remove_collector(placeholder_id)
+        logger.error(f"codex_start 执行失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool(
+    name="codex_status",
+    description="""
+    查询正在运行的 Codex 任务的增量状态。
+
+    首次调用传 cursor=0 获取所有事件。
+    后续调用传入返回的 next_cursor 值，仅获取新增事件。
+
+    当 completed=true 时，final_result 包含聚合输出。
+    当 pending_approvals 非空时，使用 codex_approve 响应审批请求。
+    """,
+    meta={"version": "2.0.0", "author": "phaseddd"},
+)
+async def codex_status(
+    thread_id: str,
+    cursor: int = 0,
+) -> Dict[str, Any]:
+    """查询 Codex 任务的增量状态。"""
+    bridge = get_bridge()
+    collector = bridge.get_collector(thread_id)
+
+    if collector is None:
+        return {
+            "success": False,
+            "error": f"未找到 thread_id: {thread_id}",
+        }
+
+    incremental = collector.read_incremental(since_index=cursor)
+
+    result: Dict[str, Any] = {
+        "success": True,
+        **incremental,
+    }
+
+    # 如果已完成，附加聚合结果
+    if incremental["completed"]:
+        aggregated = collector.get_aggregated_result()
+        result["final_result"] = aggregated
 
     return result
 
 
+@mcp.tool(
+    name="codex_interrupt",
+    description="""
+    中断正在运行的 Codex 任务。
+
+    向 app-server 发送 turn/interrupt 请求以停止当前 turn。
+    """,
+    meta={"version": "2.0.0", "author": "phaseddd"},
+)
+async def codex_interrupt(
+    thread_id: str,
+) -> Dict[str, Any]:
+    """中断正在进行的 Codex 任务。"""
+    bridge = get_bridge()
+    collector = bridge.get_collector(thread_id)
+
+    if collector is None:
+        return {"success": False, "error": f"未找到 thread_id: {thread_id}"}
+
+    if collector.is_completed():
+        return {"success": True, "message": "任务已经完成，无需中断。"}
+
+    turn_id = collector.get_current_turn_id()
+    if turn_id:
+        await bridge.interrupt_turn(thread_id, turn_id)
+
+    return {
+        "success": True,
+        "message": "中断请求已发送。",
+        "events_collected": len(collector.events),
+    }
+
+
+@mcp.tool(
+    name="codex_approve",
+    description="""
+    响应 Codex 的审批请求。
+
+    当 codex_status 返回 pending_approvals 时，使用此工具批准或拒绝操作。
+    yolo 模式下审批会自动处理，无需手动调用。
+    """,
+    meta={"version": "2.0.0", "author": "phaseddd"},
+)
+async def codex_approve(
+    thread_id: str,
+    request_id: int,
+    approve: bool = True,
+    reason: str = "",
+) -> Dict[str, Any]:
+    """响应 Codex 的审批请求。"""
+    bridge = get_bridge()
+    collector = bridge.get_collector(thread_id)
+
+    if collector is None:
+        return {"success": False, "error": f"未找到 thread_id: {thread_id}"}
+
+    # 检查审批请求是否存在
+    if request_id not in collector.pending_approvals:
+        return {"success": False, "error": f"未找到审批请求: {request_id}"}
+
+    # 发送审批响应给 app-server
+    if approve:
+        await bridge.send_response(request_id, {"approved": True})
+        collector.append_event(
+            "approvalRequest/approved",
+            {
+                "request_id": request_id,
+                **collector.pending_approvals[request_id],
+            },
+        )
+    else:
+        await bridge.send_response(
+            request_id,
+            {
+                "approved": False,
+                "reason": reason or "Declined by user via codexmcp",
+            },
+        )
+        collector.append_event(
+            "approvalRequest/declined",
+            {
+                "request_id": request_id,
+                "reason": reason,
+                **collector.pending_approvals[request_id],
+            },
+        )
+
+    # 清理已处理的审批请求
+    del collector.pending_approvals[request_id]
+
+    return {
+        "success": True,
+        "message": f"审批请求 {request_id} 已{'批准' if approve else '拒绝'}。",
+        "remaining_approvals": len(collector.pending_approvals),
+    }
+
+
+# === 服务器启动 ===
+
+
 def run() -> None:
-    """通过 stdio 传输启动 MCP 服务器。"""
-    mcp.run(transport="stdio")
+    """通过 stdio 传输启动 MCP 服务器。
+
+    包含优雅关闭逻辑：退出时自动关闭 app-server 进程。
+    """
+    from codexmcp.bridge import get_bridge
+
+    bridge = get_bridge()
+
+    try:
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # 优雅关闭 app-server
+        if bridge._process and bridge._process.returncode is None:
+            bridge._process.terminate()
+            try:
+                bridge._process.wait()
+            except Exception:
+                bridge._process.kill()
+        # 兜底退出
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
