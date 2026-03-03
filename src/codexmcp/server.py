@@ -70,19 +70,18 @@ def _build_turn_params(
     sandbox: str,
     *,
     images: list[Path] | None = None,
-    model: str = "",
     yolo: bool = False,
 ) -> Dict[str, Any]:
     """构建 turn/start 的请求参数。
 
     将 MCP 工具的用户友好参数转换为 v2 协议的精确格式。
+    模型由用户本地 Codex 配置决定，不在 per-turn 级别覆盖。
 
     Args:
         thread_id: 目标 thread ID
         prompt: 已转义的 prompt 字符串
         sandbox: 沙箱策略字符串（read-only / workspace-write / danger-full-access）
         images: 可选的图片列表
-        model: 可选的模型覆盖
         yolo: 是否启用自动审批
 
     Returns:
@@ -93,10 +92,6 @@ def _build_turn_params(
         "input": _build_user_input(prompt, images),
         "sandboxPolicy": _SANDBOX_POLICY_MAP.get(sandbox, {"type": "readOnly"}),
     }
-
-    # per-turn 模型覆盖
-    if model:
-        params["model"] = model
 
     # yolo 模式：设置 approvalPolicy 为 "never"，turn 级别跳过所有审批
     if yolo:
@@ -138,7 +133,6 @@ async def codex(
         "read-only", "workspace-write", "danger-full-access"
     ] = "read-only",
     SESSION_ID: str = "",
-    model: str = "",
     yolo: bool = False,
     return_all_messages: bool = False,
     image: list[Path] = [],
@@ -177,8 +171,6 @@ async def codex(
             )
         else:
             thread_params: Dict[str, Any] = {"cwd": str(cd)}
-            if model:
-                thread_params["model"] = model
             thread_result = await bridge.rpc_call("thread/start", thread_params)
 
         # 3. 将预创建的 collector 绑定到真实 thread_id
@@ -192,7 +184,6 @@ async def codex(
         turn_params = _build_turn_params(
             thread_id, PROMPT, sandbox,
             images=image if image else None,
-            model=model,
             yolo=yolo,
         )
 
@@ -287,7 +278,6 @@ async def codex_start(
         "read-only", "workspace-write", "danger-full-access"
     ] = "read-only",
     SESSION_ID: str = "",
-    model: str = "",
     yolo: bool = False,
     image: list[Path] = [],
 ) -> Dict[str, Any]:
@@ -315,8 +305,6 @@ async def codex_start(
             )
         else:
             thread_params: Dict[str, Any] = {"cwd": str(cd)}
-            if model:
-                thread_params["model"] = model
             thread_result = await bridge.rpc_call("thread/start", thread_params)
 
         # 绑定到真实 thread_id
@@ -330,7 +318,6 @@ async def codex_start(
         turn_params = _build_turn_params(
             thread_id, PROMPT, sandbox,
             images=image if image else None,
-            model=model,
             yolo=yolo,
         )
 
