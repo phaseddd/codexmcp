@@ -105,6 +105,7 @@ def _build_turn_params(
 
 @mcp.tool(
     name="codex",
+    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
     description="""
     通过 Codex App Server v2 协议执行 AI 辅助编码任务（阻塞模式）。
 
@@ -261,6 +262,7 @@ async def codex(
 
 @mcp.tool(
     name="codex_start",
+    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
     description="""
     启动非阻塞 Codex 会话，立即返回 thread_id。
 
@@ -340,6 +342,7 @@ async def codex_start(
 
 @mcp.tool(
     name="codex_status",
+    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
     description="""
     查询正在运行的 Codex 任务的增量状态。
 
@@ -382,6 +385,7 @@ async def codex_status(
 
 @mcp.tool(
     name="codex_interrupt",
+    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
     description="""
     中断正在运行的 Codex 任务。
 
@@ -415,6 +419,7 @@ async def codex_interrupt(
 
 @mcp.tool(
     name="codex_approve",
+    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
     description="""
     响应 Codex 的审批请求。
 
