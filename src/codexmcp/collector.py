@@ -55,6 +55,7 @@ class EventCollector:
         self.last_access_time: float = time.time()
         self.pending_approvals: dict[int, dict[str, Any]] = {}
         self.auto_approve: bool = False
+        self._token_usage: dict[str, Any] = {}  # thread/tokenUsage/updated 事件缓存
 
     def append_event(self, method: str, params: dict[str, Any]) -> None:
         """追加事件，更新 Item 状态机。
@@ -118,17 +119,23 @@ class EventCollector:
             if item_id in self.items:
                 self.items[item_id].status = "completed"
 
-        # 3. 检测 turn 完成
+        # 3. 捕获 token 使用统计（v2 协议流式通知，可能多次更新）
+        elif method == "thread/tokenUsage/updated":
+            token_usage = params.get("tokenUsage", {})
+            if token_usage:
+                self._token_usage = token_usage
+
+        # 4. 检测 turn 完成
         elif method == "turn/completed":
             self.turn_result = params
             self.turn_completed.set()  # 释放 barrier
 
-        # 4. 检测 turn 错误（也必须释放 barrier，否则阻塞模式永远等待）
+        # 5. 检测 turn 错误（也必须释放 barrier，否则阻塞模式永远等待）
         elif method == "turn/error":
             self.turn_error = params
             self.turn_completed.set()  # 释放 barrier（即使是错误也要释放）
 
-        # 5. 记录 turn 开始（保存 turn_id）
+        # 6. 记录 turn 开始（保存 turn_id）
         elif method == "turn/started":
             turn = params.get("turn", {})
             self.current_turn_id = turn.get("id")
@@ -219,10 +226,18 @@ class EventCollector:
                     }
                 )
 
-        # 提取 token_usage
+        # 提取 token_usage（优先级：流式通知 > turn/completed 顶层 > turn 嵌套）
         token_usage: dict[str, Any] = {}
-        if self.turn_result:
-            token_usage = self.turn_result.get("tokenUsage", {})
+        if self._token_usage:
+            # 优先使用 thread/tokenUsage/updated 流式事件（最可靠、字段最全）
+            token_usage = self._token_usage
+        elif self.turn_result:
+            # 回退到 turn/completed 的 tokenUsage（顶层或嵌套在 turn 对象内）
+            token_usage = (
+                self.turn_result.get("tokenUsage", {})
+                or self.turn_result.get("turn", {}).get("tokenUsage", {})
+                or self.turn_result.get("usage", {})
+            )
 
         return {
             "agent_messages": agent_messages,
@@ -244,6 +259,7 @@ class EventCollector:
         self.turn_error = None
         self.current_turn_id = None
         self.pending_approvals.clear()
+        self._token_usage = {}
 
     def is_completed(self) -> bool:
         """检查 turn 是否已完成（包括完成和出错两种情况）。"""
@@ -275,6 +291,11 @@ class EventCollector:
             case "turn/error":
                 msg = params.get("message", "未知错误")
                 return f"[Turn 错误] {msg[:80]}"
+            case "thread/tokenUsage/updated":
+                total = params.get("tokenUsage", {}).get("total", {})
+                inp = total.get("inputTokens", "?")
+                out = total.get("outputTokens", "?")
+                return f"[Token 统计] input={inp} output={out}"
             case "item/started":
                 item = params.get("item", {})
                 t = item.get("type", "unknown")

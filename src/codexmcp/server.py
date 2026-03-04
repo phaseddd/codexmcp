@@ -152,6 +152,13 @@ async def codex(
     bridge = get_bridge()
     await bridge.ensure_ready()
 
+    # 路径预校验：在调用 app-server 前快速失败
+    if not cd.exists():
+        return {
+            "success": False,
+            "error": f"工作目录不存在: {cd}",
+        }
+
     # Windows 平台 prompt 转义
     PROMPT = escape_prompt(PROMPT)
 
@@ -286,6 +293,13 @@ async def codex_start(
     """非阻塞模式：启动 Codex 任务，立即返回 thread_id。"""
     bridge = get_bridge()
     await bridge.ensure_ready()
+
+    # 路径预校验：在调用 app-server 前快速失败
+    if not cd.exists():
+        return {
+            "success": False,
+            "error": f"工作目录不存在: {cd}",
+        }
 
     # Windows 平台 prompt 转义
     PROMPT = escape_prompt(PROMPT)
