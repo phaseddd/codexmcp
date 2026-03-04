@@ -18,6 +18,9 @@ MAX_RETRIES = 3
 # 单次 RPC 请求超时（秒）
 REQUEST_TIMEOUT = 300.0
 
+# 握手超时（秒），新进程初始化不应耗时太久
+HANDSHAKE_TIMEOUT = 30.0
+
 # Turn 总超时（秒），防止无限等待
 TURN_TOTAL_TIMEOUT = 1800
 

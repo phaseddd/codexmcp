@@ -27,6 +27,7 @@ from typing import Any
 from codexmcp.collector import EventCollector
 from codexmcp.errors import (
     BACKPRESSURE_ERROR_CODE,
+    HANDSHAKE_TIMEOUT,
     MAX_RETRIES,
     REQUEST_TIMEOUT,
     AppServerError,
@@ -121,28 +122,44 @@ class AppServerBridge:
         self._read_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._read_stderr())
 
-        # 完成握手
-        await self._handshake()
+        # 完成握手（失败时清理孤儿进程和 Task）
+        try:
+            await self._handshake()
+        except Exception:
+            logger.error("app-server 握手失败，清理孤儿进程...")
+            await self._cleanup()
+            raise
 
     async def _handshake(self) -> None:
         """完成 app-server 协议握手。
 
         按照 v2 协议，先发送 initialize 请求获取服务端信息，
         然后发送 initialized 通知确认握手完成。
+
+        使用独立的 HANDSHAKE_TIMEOUT（30s）而非通用 REQUEST_TIMEOUT（300s），
+        让新进程无响应时快速失败，避免重连场景长时间挂起。
         """
-        result = await self.rpc_call(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "codexmcp",
-                    "title": "CodexMCP Bridge",
-                    "version": "2.0.0",
-                },
-                "capabilities": {
-                    "experimentalApi": False,
-                },
-            },
-        )
+        try:
+            result = await asyncio.wait_for(
+                self.rpc_call(
+                    "initialize",
+                    {
+                        "clientInfo": {
+                            "name": "codexmcp",
+                            "title": "CodexMCP Bridge",
+                            "version": "2.0.0",
+                        },
+                        "capabilities": {
+                            "experimentalApi": False,
+                        },
+                    },
+                ),
+                timeout=HANDSHAKE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"app-server 握手超时（{HANDSHAKE_TIMEOUT}s），进程可能无法正常启动"
+            ) from None
         logger.info(f"握手完成: {result}")
 
         await self.send_notification("initialized", {})
@@ -168,14 +185,14 @@ class AppServerBridge:
 
     async def _cleanup(self) -> None:
         """终止旧进程，清理状态。"""
-        # 取消读取任务
+        # 取消读取任务（无论 task 是否已完成都重置引用）
         if self._read_task and not self._read_task.done():
             self._read_task.cancel()
             try:
                 await self._read_task
             except asyncio.CancelledError:
                 pass
-            self._read_task = None
+        self._read_task = None
 
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()
@@ -183,7 +200,7 @@ class AppServerBridge:
                 await self._stderr_task
             except asyncio.CancelledError:
                 pass
-            self._stderr_task = None
+        self._stderr_task = None
 
         # 终止进程
         if self._process and self._process.returncode is None:
