@@ -267,7 +267,8 @@ def setup_signal_handlers(shutdown_callback: Callable[[], None]) -> None:
     """设置信号处理器，实现优雅关闭。
 
     仅在主线程中注册信号处理器。
-    SIGINT 始终注册，SIGTERM 仅在非 Windows 平台注册。
+    SIGINT 始终注册；Windows 额外尝试注册 SIGTERM/SIGBREAK，
+    非 Windows 注册 SIGTERM。
 
     Args:
         shutdown_callback: 收到关闭信号时调用的回调函数
@@ -282,7 +283,12 @@ def setup_signal_handlers(shutdown_callback: Callable[[], None]) -> None:
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_shutdown)
-    if not IS_WINDOWS:
+    if IS_WINDOWS:
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, handle_shutdown)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, handle_shutdown)
+    else:
         signal.signal(signal.SIGTERM, handle_shutdown)
 
 
@@ -298,26 +304,74 @@ def start_parent_monitor() -> None:
         return
 
     import ctypes
+    from ctypes import wintypes
 
     parent_pid = os.getppid()
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
 
-    def is_parent_alive(pid: int) -> bool:
-        """通过 Windows API 检查指定进程是否存活。"""
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    SYNCHRONIZE = 0x00100000
+    ERROR_INVALID_PARAMETER = 87
+    WAIT_TIMEOUT = 0x00000102
+    access_mask = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+
+    def open_process(pid: int) -> tuple[int, int]:
+        """打开进程句柄，返回 (handle, last_error)。"""
+        kernel32.SetLastError(0)
+        handle = kernel32.OpenProcess(access_mask, False, pid)
+        return handle, kernel32.GetLastError()
+
+    def get_start_time_key(handle: int) -> int | None:
+        """读取进程创建时间，用于避免 PID 复用误判。"""
+        creation_time = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation_time),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        )
+        if not ok:
+            return None
+        return (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
+
+    first_handle, first_err = open_process(parent_pid)
+    if not first_handle and first_err == ERROR_INVALID_PARAMETER:
+        logger.warning(f"父进程 {parent_pid} 在监控启动前已退出，终止当前进程")
+        os._exit(0)
+
+    parent_start_time = None
+    if first_handle:
+        try:
+            parent_start_time = get_start_time_key(first_handle)
+        finally:
+            kernel32.CloseHandle(first_handle)
+
+    def is_parent_alive(pid: int, expected_start_time: int | None) -> bool:
+        """检查父进程是否仍为同一存活进程。"""
+        handle, last_error = open_process(pid)
         if not handle:
-            return True  # 无法访问则假定存活（安全策略）
-        exit_code = ctypes.c_ulong()
-        result = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-        kernel32.CloseHandle(handle)
-        return bool(result and exit_code.value == STILL_ACTIVE)
+            return last_error != ERROR_INVALID_PARAMETER
+
+        try:
+            if expected_start_time is not None:
+                current_start_time = get_start_time_key(handle)
+                if (
+                    current_start_time is not None
+                    and current_start_time != expected_start_time
+                ):
+                    return False
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
 
     def monitor_parent() -> None:
         """守护线程：周期性检查父进程存活状态。"""
         while True:
-            if not is_parent_alive(parent_pid):
+            if not is_parent_alive(parent_pid, parent_start_time):
                 logger.warning(f"父进程 {parent_pid} 已退出，终止当前进程")
                 os._exit(0)
             time.sleep(2)
