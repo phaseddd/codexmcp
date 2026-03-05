@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import time
 from typing import Any
@@ -103,18 +104,26 @@ class AppServerBridge:
 
     async def _start_process(self) -> None:
         """启动 app-server 子进程并完成握手。"""
-        cmd = build_app_server_cmd(
+        cmd, extra_path = build_app_server_cmd(
             config=self._config if self._config else None,
             profile=self._profile,
             yolo=self._yolo_global,
         )
         logger.info(f"启动 app-server: {' '.join(cmd)}")
 
+        # 构建子进程环境变量（仅当需要追加 PATH 时显式传入）
+        env = None
+        if extra_path:
+            env = os.environ.copy()
+            env["PATH"] = extra_path + os.pathsep + env.get("PATH", "")
+            logger.info(f"子进程 PATH 已追加: {extra_path}")
+
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **({"env": env} if env is not None else {}),
         )
         logger.info(f"app-server 进程已启动 PID={self._process.pid}")
 
@@ -351,18 +360,33 @@ class AppServerBridge:
         - 有 method + 有 id → 服务端请求（审批等）
         """
         assert self._process and self._process.stdout
+        lines_read = 0
+        json_msgs = 0
+        start_time = time.time()
         try:
             while True:
                 line = await self._process.stdout.readline()
                 if not line:
-                    break  # 进程 stdout 关闭
+                    # 诊断：记录进程退出状态和统计信息
+                    elapsed = time.time() - start_time
+                    rc = self._process.returncode
+                    pid = self._process.pid
+                    logger.warning(
+                        f"app-server stdout 已关闭 "
+                        f"(pid={pid}, returncode={rc}, "
+                        f"存活={elapsed:.1f}s, "
+                        f"读取行数={lines_read}, JSON消息={json_msgs})"
+                    )
+                    break
 
+                lines_read += 1
                 line_str = line.decode("utf-8").strip()
                 if not line_str:
                     continue
 
                 try:
                     msg = json.loads(line_str)
+                    json_msgs += 1
                     self._non_json_count = 0  # 重置计数器
                 except json.JSONDecodeError:
                     # 非 JSON 行：记录告警，连续异常超阈值则报错
@@ -392,6 +416,16 @@ class AppServerBridge:
             logger.error(f"读取循环异常: {e}")
         finally:
             # 关键：进程断连时统一 fail 所有等待中的请求
+            pending_count = len(self._pending_requests)
+            collector_count = sum(
+                1 for c in self._event_collectors.values()
+                if not c.is_completed()
+            )
+            logger.warning(
+                f"_read_loop 退出，清理中 "
+                f"(pending_requests={pending_count}, "
+                f"active_collectors={collector_count})"
+            )
             self._fail_all_pending(
                 AppServerNotReady("app-server 进程已断开")
             )
