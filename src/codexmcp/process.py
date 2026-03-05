@@ -25,29 +25,68 @@ logger = logging.getLogger(__name__)
 
 # === 原生二进制直接解析（跨平台） ===
 
-# 目标三元组映射：(sys.platform, platform.machine()) → Rust target triple
-# 覆盖 Windows / macOS / Linux 的 x64 和 arm64 架构
-_TARGET_TRIPLES: dict[tuple[str, str], str] = {
-    # Linux
-    ("linux", "x86_64"): "x86_64-unknown-linux-musl",
-    ("linux", "aarch64"): "aarch64-unknown-linux-musl",
-    # macOS
-    ("darwin", "x86_64"): "x86_64-apple-darwin",
-    ("darwin", "arm64"): "aarch64-apple-darwin",  # Apple Silicon
-    # Windows
-    ("win32", "AMD64"): "x86_64-pc-windows-msvc",
-    ("win32", "ARM64"): "aarch64-pc-windows-msvc",
+# 机器架构归一化：处理不同系统/运行环境下的别名差异
+_MACHINE_ALIASES: dict[str, str] = {
+    # x64 常见写法
+    "x86_64": "x86_64",
+    "amd64": "x86_64",
+    "x64": "x86_64",
+    "x86-64": "x86_64",
+    # arm64 常见写法
+    "aarch64": "aarch64",
+    "arm64": "aarch64",
 }
 
-# 平台包目录名映射：target_triple → npm 平台包目录名（不含 @openai/ 前缀）
-_PLATFORM_PACKAGES: dict[str, str] = {
-    "x86_64-unknown-linux-musl": "codex-linux-x64",
-    "aarch64-unknown-linux-musl": "codex-linux-arm64",
-    "x86_64-apple-darwin": "codex-darwin-x64",
-    "aarch64-apple-darwin": "codex-darwin-arm64",
-    "x86_64-pc-windows-msvc": "codex-win32-x64",
-    "aarch64-pc-windows-msvc": "codex-win32-arm64",
+# 单一事实表：(sys.platform, normalized_machine) → {triple, package}
+# package 为 npm 平台包目录名（不含 @openai/ 前缀）
+_PLATFORM_TARGETS: dict[tuple[str, str], dict[str, str]] = {
+    # Linux
+    ("linux", "x86_64"): {
+        "triple": "x86_64-unknown-linux-musl",
+        "package": "codex-linux-x64",
+    },
+    ("linux", "aarch64"): {
+        "triple": "aarch64-unknown-linux-musl",
+        "package": "codex-linux-arm64",
+    },
+    # macOS
+    ("darwin", "x86_64"): {
+        "triple": "x86_64-apple-darwin",
+        "package": "codex-darwin-x64",
+    },
+    ("darwin", "aarch64"): {
+        "triple": "aarch64-apple-darwin",
+        "package": "codex-darwin-arm64",
+    },
+    # Windows
+    ("win32", "x86_64"): {
+        "triple": "x86_64-pc-windows-msvc",
+        "package": "codex-win32-x64",
+    },
+    ("win32", "aarch64"): {
+        "triple": "aarch64-pc-windows-msvc",
+        "package": "codex-win32-arm64",
+    },
 }
+
+# 向后兼容：保留旧常量名，实际由单一事实表自动派生，避免双源漂移
+_TARGET_TRIPLES: dict[tuple[str, str], str] = {
+    key: value["triple"] for key, value in _PLATFORM_TARGETS.items()
+}
+_PLATFORM_PACKAGES: dict[str, str] = {
+    value["triple"]: value["package"] for value in _PLATFORM_TARGETS.values()
+}
+
+
+def _normalize_platform_arch() -> tuple[str, str, str, str]:
+    """规范化平台与架构键，降低 platform.machine() 别名差异带来的失配。"""
+    raw_platform = sys.platform
+    raw_machine = plat.machine()
+
+    platform_key = raw_platform.lower()
+    machine_key = raw_machine.strip().lower()
+    normalized_machine = _MACHINE_ALIASES.get(machine_key, machine_key)
+    return platform_key, normalized_machine, raw_platform, raw_machine
 
 
 def _resolve_native_binary() -> tuple[str, str | None] | None:
@@ -71,17 +110,19 @@ def _resolve_native_binary() -> tuple[str, str | None] | None:
     if not codex_path:
         return None
 
-    triple = _TARGET_TRIPLES.get((sys.platform, plat.machine()))
-    if not triple:
+    platform_key, machine_key, raw_platform, raw_machine = _normalize_platform_arch()
+    target_info = _PLATFORM_TARGETS.get((platform_key, machine_key))
+    if not target_info:
         logger.debug(
-            f"不支持的平台组合: {sys.platform}/{plat.machine()}，跳过原生解析"
+            "不支持的平台组合: "
+            f"{raw_platform}/{raw_machine} (规范化后: {platform_key}/{machine_key})，"
+            "跳过原生解析"
         )
         return None
 
+    triple = target_info["triple"]
+    platform_pkg = target_info["package"]
     binary_name = "codex.exe" if IS_WINDOWS else "codex"
-    platform_pkg = _PLATFORM_PACKAGES.get(triple)
-    if not platform_pkg:
-        return None
 
     shim_dir = os.path.dirname(os.path.abspath(codex_path))
 
