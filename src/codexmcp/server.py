@@ -6,7 +6,7 @@
 5 个 MCP 工具：
 - codex       — 阻塞模式（向后兼容），等待 turn 完成后返回聚合结果
 - codex_start — 非阻塞模式，启动后立即返回 thread_id
-- codex_status — 增量查询，按 cursor 返回新事件
+- codex_status — 增量查询，按 cursor 返回 Item 级快照
 - codex_interrupt — 中断正在进行的 turn
 - codex_approve — 响应审批请求（批准/拒绝）
 """
@@ -42,6 +42,26 @@ _SANDBOX_POLICY_MAP: Dict[str, Dict[str, str]] = {
     "workspace-write": {"type": "workspaceWrite"},
     "danger-full-access": {"type": "dangerFullAccess"},
 }
+
+
+def _build_status_payload(
+    collector: Any,
+    *,
+    cursor: int = 0,
+    raw_events: bool = False,
+) -> Dict[str, Any]:
+    """统一构造状态查询返回体。"""
+    incremental = collector.read_incremental(
+        since_index=cursor,
+        raw_events=raw_events,
+    )
+    result: Dict[str, Any] = {
+        "success": True,
+        **incremental,
+    }
+    if incremental["completed"]:
+        result["final_result"] = collector.get_aggregated_result()
+    return result
 
 
 def _build_user_input(prompt: str, images: list[Path] | None = None) -> list[Dict[str, Any]]:
@@ -238,12 +258,26 @@ async def codex(
 
         # 7. 聚合返回
         aggregated = collector.get_aggregated_result()
+        status_payload = _build_status_payload(
+            collector,
+            cursor=0,
+            raw_events=False,
+        )
         result: Dict[str, Any] = {
             "success": True,
             "SESSION_ID": thread_id,
             "agent_messages": aggregated["agent_messages"],
             "token_usage": aggregated["token_usage"],
+            "completed": status_payload["completed"],
+            "has_error": status_payload["has_error"],
+            "status": status_payload["status"],
+            "next_cursor": status_payload["next_cursor"],
+            "transport": status_payload["transport"],
+            "diagnostics": status_payload["diagnostics"],
+            "final_result": aggregated,
         }
+        if status_payload["status"] == "transport_lost":
+            result["message"] = "app-server 传输已断开，返回当前已聚合结果。"
 
         # 可选：返回事件摘要（仅 summary，不含 params，避免撑爆上下文）
         if return_all_messages:
@@ -251,6 +285,9 @@ async def codex(
                 {"method": e.method, "summary": e.summary}
                 for e in collector.events
             ]
+            result["changed_items"] = status_payload["changed_items"]
+            result["lifecycle_events"] = status_payload["lifecycle_events"]
+            result["diagnostic_events"] = status_payload["diagnostic_events"]
             result["command_executions"] = aggregated["command_executions"]
             result["file_changes"] = aggregated["file_changes"]
             result["reasoning_segments"] = aggregated["reasoning_segments"]
@@ -360,8 +397,11 @@ async def codex_start(
     description="""
     查询正在运行的 Codex 任务的增量状态。
 
-    首次调用传 cursor=0 获取所有事件。
-    后续调用传入返回的 next_cursor 值，仅获取新增事件。
+    首次调用传 cursor=0 获取全部快照。
+    后续调用传入返回的 next_cursor 值，仅获取新增变化。
+
+    默认返回 Item 级快照（changed_items / lifecycle_events / diagnostic_events）。
+    如需排障，可传 raw_events=true 保留原始 new_events。
 
     当 completed=true 时，final_result 包含聚合输出。
     当 pending_approvals 非空时，使用 codex_approve 响应审批请求。
@@ -371,6 +411,7 @@ async def codex_start(
 async def codex_status(
     thread_id: str,
     cursor: int = 0,
+    raw_events: bool = False,
 ) -> Dict[str, Any]:
     """查询 Codex 任务的增量状态。"""
     bridge = get_bridge()
@@ -382,19 +423,11 @@ async def codex_status(
             "error": f"未找到 thread_id: {thread_id}",
         }
 
-    incremental = collector.read_incremental(since_index=cursor)
-
-    result: Dict[str, Any] = {
-        "success": True,
-        **incremental,
-    }
-
-    # 如果已完成，附加聚合结果
-    if incremental["completed"]:
-        aggregated = collector.get_aggregated_result()
-        result["final_result"] = aggregated
-
-    return result
+    return _build_status_payload(
+        collector,
+        cursor=cursor,
+        raw_events=raw_events,
+    )
 
 
 @mcp.tool(

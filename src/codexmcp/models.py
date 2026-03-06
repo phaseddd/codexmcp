@@ -21,11 +21,16 @@ class ItemState:
     Attributes:
         item_id: Item 唯一标识符
         item_type: Item 类型（agentMessage / commandExecution / fileChange / reasoning）
-        status: 当前状态（started / streaming / completed）
-        content_buffer: 累积的 delta 内容（文本/输出/diff）
+        status: 当前状态（started / streaming / completed / failed 等）
+        content_buffer: 非 reasoning 类型的累积 delta 内容（文本/输出/diff）
         reasoning_summary: reasoning 类型的 summaryDelta 累积
         reasoning_text: reasoning 类型的 textDelta 累积
-        metadata: item/started 事件的完整参数（保留原始信息用于聚合）
+        metadata_started: item/started 原始元数据
+        metadata_completed: item/completed 原始元数据
+        metadata_effective: 聚合后的最终元数据（completed 覆盖 started）
+        last_emitted_content_len: 最近一次轮询已发出的 content 长度
+        last_emitted_reasoning_summary_len: 最近一次轮询已发出的 summary 长度
+        last_emitted_reasoning_text_len: 最近一次轮询已发出的 reasoning text 长度
     """
 
     item_id: str
@@ -34,7 +39,12 @@ class ItemState:
     content_buffer: str = ""
     reasoning_summary: str = ""
     reasoning_text: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata_started: dict[str, Any] = field(default_factory=dict)
+    metadata_completed: dict[str, Any] = field(default_factory=dict)
+    metadata_effective: dict[str, Any] = field(default_factory=dict)
+    last_emitted_content_len: int = 0
+    last_emitted_reasoning_summary_len: int = 0
+    last_emitted_reasoning_text_len: int = 0
 
 
 @dataclass

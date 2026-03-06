@@ -363,14 +363,28 @@ class AppServerBridge:
         lines_read = 0
         json_msgs = 0
         start_time = time.time()
+        disconnect_context: dict[str, Any] = {}
         try:
             while True:
                 line = await self._process.stdout.readline()
                 if not line:
                     # 诊断：记录进程退出状态和统计信息
                     elapsed = time.time() - start_time
-                    rc = self._process.returncode
+                    rc = await self._wait_for_process_exit_code()
                     pid = self._process.pid
+                    disconnect_context = {
+                        "disconnect_reason": "stdout_eof",
+                        "process_exit_code": rc,
+                        "timestamp": time.time(),
+                        "transport_error": {
+                            "type": "stdout_eof",
+                            "message": "app-server stdout 已关闭",
+                            "lines_read": lines_read,
+                            "json_messages": json_msgs,
+                            "alive_seconds": elapsed,
+                            "pid": pid,
+                        },
+                    }
                     logger.warning(
                         f"app-server stdout 已关闭 "
                         f"(pid={pid}, returncode={rc}, "
@@ -414,6 +428,17 @@ class AppServerBridge:
             pass
         except Exception as e:
             logger.error(f"读取循环异常: {e}")
+            disconnect_context = {
+                "disconnect_reason": "read_loop_exception",
+                "process_exit_code": (
+                    self._process.returncode if self._process else None
+                ),
+                "timestamp": time.time(),
+                "transport_error": {
+                    "type": e.__class__.__name__,
+                    "message": str(e),
+                },
+            }
         finally:
             # 关键：进程断连时统一 fail 所有等待中的请求
             pending_count = len(self._pending_requests)
@@ -427,7 +452,8 @@ class AppServerBridge:
                 f"active_collectors={collector_count})"
             )
             self._fail_all_pending(
-                AppServerNotReady("app-server 进程已断开")
+                AppServerNotReady("app-server 进程已断开"),
+                disconnect_context,
             )
             self._initialized = False
 
@@ -487,7 +513,22 @@ class AppServerBridge:
             if not future.done():
                 future.set_result(msg)
 
-    def _fail_all_pending(self, exc: Exception) -> None:
+    async def _wait_for_process_exit_code(self) -> int | None:
+        """尽量等待子进程退出，拿到更准确的 returncode。"""
+        if self._process is None:
+            return None
+        if self._process.returncode is not None:
+            return self._process.returncode
+        try:
+            return await asyncio.wait_for(self._process.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            return self._process.returncode
+
+    def _fail_all_pending(
+        self,
+        exc: Exception,
+        disconnect_context: dict[str, Any] | None = None,
+    ) -> None:
         """进程断连时，统一 fail 所有等待中的 Future。
 
         避免 300s 超时悬挂。同时给所有未完成的 collector
@@ -495,6 +536,7 @@ class AppServerBridge:
 
         Args:
             exc: 要设置给 Future 的异常
+            disconnect_context: 断连诊断上下文
         """
         for future in self._pending_requests.values():
             if not future.done():
@@ -502,17 +544,23 @@ class AppServerBridge:
         self._pending_requests.clear()
 
         # 同时给所有未完成的 collector 注入断连事件
+        base_context = dict(disconnect_context or {})
+        base_context.setdefault("timestamp", time.time())
+        base_context.setdefault(
+            "process_exit_code",
+            self._process.returncode if self._process else None,
+        )
+        base_context.setdefault(
+            "disconnect_reason",
+            base_context.get("disconnect_reason") or "app-server_disconnected",
+        )
+        base_context.setdefault("error", str(exc))
         for collector in self._event_collectors.values():
             if not collector.is_completed():
                 collector.append_event(
                     "bridge/disconnected",
-                    {
-                        "error": str(exc),
-                        "timestamp": time.time(),
-                    },
+                    dict(base_context),
                 )
-                collector.turn_error = {"message": str(exc)}
-                collector.turn_completed.set()  # 释放所有等待的 barrier
 
     async def _handle_server_request(self, msg: dict[str, Any]) -> None:
         """处理 app-server 发来的服务端请求（如审批请求）。

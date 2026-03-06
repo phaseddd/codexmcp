@@ -118,7 +118,7 @@
 
 **步骤 3.2 验证点**:
 - [ ] 每次返回的 `next_cursor` >= 上次传入的 `cursor`（游标单调递增）
-- [ ] `new_events` 数组包含事件（非空至少一次）
+- [ ] 默认返回的 `changed_items` / `lifecycle_events` 至少有一类非空
 - [ ] 最终 `completed` === `true`
 - [ ] `final_result` 存在且 `agent_messages` 非空
 - [ ] `final_result.agent_messages` 提及 `health`、`pose`、`stream` 相关路由
