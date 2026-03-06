@@ -1,5 +1,6 @@
 # Project-specific
 codexmcp-doc/
+.cache-openai-codex*/
 *CLAUDE.md
 _temp_commands/
 _temp_skills/
