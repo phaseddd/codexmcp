@@ -28,9 +28,6 @@ class ItemState:
         metadata_started: item/started 原始元数据
         metadata_completed: item/completed 原始元数据
         metadata_effective: 聚合后的最终元数据（completed 覆盖 started）
-        last_emitted_content_len: 最近一次轮询已发出的 content 长度
-        last_emitted_reasoning_summary_len: 最近一次轮询已发出的 summary 长度
-        last_emitted_reasoning_text_len: 最近一次轮询已发出的 reasoning text 长度
     """
 
     item_id: str
@@ -42,9 +39,6 @@ class ItemState:
     metadata_started: dict[str, Any] = field(default_factory=dict)
     metadata_completed: dict[str, Any] = field(default_factory=dict)
     metadata_effective: dict[str, Any] = field(default_factory=dict)
-    last_emitted_content_len: int = 0
-    last_emitted_reasoning_summary_len: int = 0
-    last_emitted_reasoning_text_len: int = 0
 
 
 @dataclass

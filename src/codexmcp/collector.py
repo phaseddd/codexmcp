@@ -82,13 +82,19 @@ class EventCollector:
         self.pending_approvals: dict[int, dict[str, Any]] = {}
         self.auto_approve: bool = False
         self._token_usage: dict[str, Any] = {}  # thread/tokenUsage/updated 事件缓存
+        self._oldest_event_index: int = 0
         self._next_event_index: int = 0
 
     def append_event(self, method: str, params: dict[str, Any]) -> None:
         """追加事件，更新 Item 状态机和 turn/transport 状态。"""
         if len(self.events) >= self.MAX_EVENTS_PER_THREAD:
             half = len(self.events) // 2
-            self.events = self.events[half:]
+            retained = self.events[half:]
+            if retained:
+                self._oldest_event_index = retained[0].index
+            else:
+                self._oldest_event_index = self._next_event_index
+            self.events = retained
             self.truncated = True
 
         event = CollectedEvent(
@@ -185,10 +191,13 @@ class EventCollector:
         since_index: int = 0,
         *,
         raw_events: bool = False,
+        view: str = "compact",
     ) -> dict[str, Any]:
         """从指定原始事件索引开始读取增量状态。"""
         self.touch()
-        since_index = max(0, min(since_index, self._next_event_index))
+        requested_cursor = max(0, min(since_index, self._next_event_index))
+        cursor_stale = requested_cursor < self._oldest_event_index
+        effective_since_index = max(requested_cursor, self._oldest_event_index)
 
         result = {
             "thread_id": self.thread_id,
@@ -196,6 +205,9 @@ class EventCollector:
             "has_error": self.turn_error is not None,
             "status": self.completion_state,
             "truncated": self.truncated,
+            "oldest_cursor": self._oldest_event_index,
+            "cursor_stale": cursor_stale,
+            "resync_required": cursor_stale,
             "next_cursor": self._next_event_index,
             "transport": {
                 "connected": not self.transport_disconnected,
@@ -208,10 +220,15 @@ class EventCollector:
                 "event_count": self._next_event_index,
                 "active_items": self._build_active_items(),
             },
-            "changed_items": self._build_changed_items_since(since_index),
-            "lifecycle_events": self._build_lifecycle_events_since(since_index),
+            "changed_items": self._build_changed_items_since(
+                effective_since_index,
+                view=view,
+            ),
+            "lifecycle_events": self._build_lifecycle_events_since(
+                effective_since_index
+            ),
             "diagnostic_events": self._build_diagnostic_events_since(
-                since_index
+                effective_since_index
             ),
             "pending_approvals": [
                 {"request_id": rid, "params": params}
@@ -222,14 +239,14 @@ class EventCollector:
         if raw_events:
             result["new_events"] = [
                 self._serialize_raw_event(event)
-                for event in self._events_since(since_index)
+                for event in self._events_since(effective_since_index)
             ]
 
         return result
 
     def get_aggregated_result(self) -> dict[str, Any]:
         """聚合当前 turn 的 Item 状态为最终结果。"""
-        agent_messages: list[str] = []
+        agent_message_items: list[dict[str, str]] = []
         command_executions: list[dict[str, Any]] = []
         file_changes: list[dict[str, Any]] = []
         reasoning_segments: list[dict[str, Any]] = []
@@ -240,8 +257,13 @@ class EventCollector:
 
             if item.item_type == "agentMessage":
                 if item.content_buffer:
-                    agent_messages.append(
-                        self._normalize_newlines(item.content_buffer)
+                    agent_message_items.append(
+                        {
+                            "id": item.item_id,
+                            "text": self._normalize_newlines(
+                                item.content_buffer
+                            ),
+                        }
                     )
             elif item.item_type == "commandExecution":
                 command_executions.append(
@@ -299,7 +321,10 @@ class EventCollector:
             )
 
         return {
-            "agent_messages": "".join(agent_messages),
+            "agent_messages_text": "\n\n".join(
+                item["text"] for item in agent_message_items
+            ),
+            "agent_message_items": agent_message_items,
             "command_executions": command_executions,
             "file_changes": file_changes,
             "reasoning_segments": reasoning_segments,
@@ -328,6 +353,7 @@ class EventCollector:
         self.last_event_method = None
         self.pending_approvals.clear()
         self._token_usage = {}
+        self._oldest_event_index = 0
         self._next_event_index = 0
 
     def is_completed(self) -> bool:
@@ -353,7 +379,10 @@ class EventCollector:
         }
 
     def _build_changed_items_since(
-        self, since_index: int
+        self,
+        since_index: int,
+        *,
+        view: str = "compact",
     ) -> list[dict[str, Any]]:
         changed: dict[str, dict[str, Any]] = {}
 
@@ -423,13 +452,11 @@ class EventCollector:
                     metadata.get("changes")
                 )
 
-            snapshots.append(snapshot)
+            if view == "compact" and self._is_terminal_status(status):
+                snapshot.pop("delta", None)
+                snapshot.pop("content", None)
 
-            item.last_emitted_content_len = len(item.content_buffer)
-            item.last_emitted_reasoning_summary_len = len(
-                item.reasoning_summary
-            )
-            item.last_emitted_reasoning_text_len = len(item.reasoning_text)
+            snapshots.append(snapshot)
 
         return snapshots
 
@@ -559,11 +586,16 @@ class EventCollector:
         if item.item_type == "reasoning":
             content: dict[str, str] = {}
             if item.reasoning_summary:
-                content["summary"] = item.reasoning_summary
+                content["summary"] = self._normalize_newlines(
+                    item.reasoning_summary
+                )
             if item.reasoning_text:
-                content["text"] = item.reasoning_text
+                content["text"] = self._normalize_newlines(item.reasoning_text)
             return content
         return self._normalize_newlines(item.content_buffer)
+
+    def _is_terminal_status(self, status: str) -> bool:
+        return status in {"completed", "failed", "cancelled"}
 
     def _merge_dicts(
         self, base: dict[str, Any], override: dict[str, Any]

@@ -3,10 +3,11 @@
 通过 MCP 协议桥接 Claude Code 和 Codex App Server v2 API，
 提供阻塞模式、轮询模式、中断和审批能力。
 
-5 个 MCP 工具：
-- codex       — 阻塞模式（向后兼容），等待 turn 完成后返回聚合结果
-- codex_start — 非阻塞模式，启动后立即返回 thread_id
-- codex_status — 增量查询，按 cursor 返回 Item 级快照
+6 个 MCP 工具：
+- codex         — 阻塞模式（向后兼容），等待 turn 完成后返回紧凑结果
+- codex_start   — 非阻塞模式，启动后立即返回 thread_id
+- codex_status  — 增量查询，按 cursor 返回 Item 级快照
+- codex_result  — 获取已完成任务的最终聚合结果
 - codex_interrupt — 中断正在进行的 turn
 - codex_approve — 响应审批请求（批准/拒绝）
 """
@@ -23,10 +24,19 @@ from typing import Any, Dict, Literal
 from uuid import uuid4
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import CallToolResult
 
 from codexmcp.bridge import get_bridge
 from codexmcp.compat import IS_WINDOWS  # noqa: F401 — 保留平台检测常量供外部使用
 from codexmcp.errors import TURN_TOTAL_TIMEOUT
+from codexmcp.output import (
+    build_call_tool_result,
+    build_error_result,
+    build_result_content,
+    build_result_structured,
+    build_status_content,
+    build_status_structured,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,19 +59,54 @@ def _build_status_payload(
     *,
     cursor: int = 0,
     raw_events: bool = False,
+    detail: Literal["compact", "verbose"] = "compact",
 ) -> Dict[str, Any]:
-    """统一构造状态查询返回体。"""
-    incremental = collector.read_incremental(
-        since_index=cursor,
+    """统一构造状态查询结构化返回体。"""
+    return build_status_structured(
+        collector,
+        cursor=cursor,
         raw_events=raw_events,
+        detail=detail,
     )
-    result: Dict[str, Any] = {
-        "success": True,
-        **incremental,
-    }
-    if incremental["completed"]:
-        result["final_result"] = collector.get_aggregated_result()
-    return result
+
+
+def _render_status_result(
+    collector: Any,
+    *,
+    cursor: int = 0,
+    raw_events: bool = False,
+    detail: Literal["compact", "verbose"] = "compact",
+) -> CallToolResult:
+    structured = _build_status_payload(
+        collector,
+        cursor=cursor,
+        raw_events=raw_events,
+        detail=detail,
+    )
+    return build_call_tool_result(
+        build_status_content(structured),
+        structured,
+    )
+
+
+def _render_result_result(
+    collector: Any,
+    *,
+    detail: Literal["compact", "full"] = "compact",
+    include_raw_events: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> CallToolResult:
+    structured = build_result_structured(
+        collector,
+        detail=detail,
+        include_raw_events=include_raw_events,
+    )
+    if extra:
+        structured.update(extra)
+    return build_call_tool_result(
+        build_result_content(structured),
+        structured,
+    )
 
 
 def _build_user_input(prompt: str, images: list[Path] | None = None) -> list[Dict[str, Any]]:
@@ -125,7 +170,7 @@ def _build_turn_params(
 
 @mcp.tool(
     name="codex",
-    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
+    structured_output=False,  # 显式返回 CallToolResult，避免普通 dict 被自动转为 JSON 文本
     description="""
     通过 Codex App Server v2 协议执行 AI 辅助编码任务（阻塞模式）。
 
@@ -157,7 +202,7 @@ async def codex(
     yolo: bool = False,
     return_all_messages: bool = False,
     image: list[Path] = [],
-) -> Dict[str, Any]:
+) -> CallToolResult:
     """阻塞模式：发送 prompt，等待 turn 完成，返回聚合结果。
 
     流程：
@@ -174,10 +219,7 @@ async def codex(
 
     # 路径预校验：在调用 app-server 前快速失败
     if not cd.exists():
-        return {
-            "success": False,
-            "error": f"工作目录不存在: {cd}",
-        }
+        return build_error_result(f"工作目录不存在: {cd}")
 
     # Windows 平台 prompt 转义已移除：json.dumps 会自动处理 JSON 转义，
     # escape_prompt 会导致双重转义（\n 变成字面 \\n）
@@ -186,14 +228,13 @@ async def codex(
     if SESSION_ID:
         existing = bridge.get_collector(SESSION_ID)
         if existing and existing.transport_disconnected:
-            return {
-                "success": False,
-                "error": (
+            return build_error_result(
+                (
                     f"会话已丢失（{existing.disconnect_reason}），"
                     "进程重启后无法恢复。请不带 SESSION_ID 启动新会话。"
                 ),
-                "SESSION_ID": SESSION_ID,
-            }
+                thread_id=SESSION_ID,
+            )
 
     # 1. 预创建 collector（防止通知早于响应到达时丢失）
     placeholder_id = f"__pending_{uuid4().hex[:8]}"
@@ -238,12 +279,20 @@ async def codex(
             # 检查总超时
             if time.time() - start_time > TURN_TOTAL_TIMEOUT:
                 await bridge.interrupt_turn(thread_id, collector.current_turn_id)
-                return {
-                    "success": False,
-                    "error": f"Turn 执行超时（{TURN_TOTAL_TIMEOUT // 60} 分钟）",
-                    "SESSION_ID": thread_id,
-                    "partial_result": collector.get_aggregated_result(),
-                }
+                partial = build_result_structured(
+                    collector,
+                    detail="compact",
+                )
+                return build_error_result(
+                    f"Turn 执行超时（{TURN_TOTAL_TIMEOUT // 60} 分钟）",
+                    thread_id=thread_id,
+                    details={
+                        "status": partial["status"],
+                        "transport": partial["transport"],
+                        "diagnostics": partial["diagnostics"],
+                        "partial_result": partial["final_result"],
+                    },
+                )
 
             try:
                 await asyncio.wait_for(
@@ -262,52 +311,48 @@ async def codex(
 
         # 6. 检查 turn 错误
         if collector.turn_error:
-            return {
-                "success": False,
-                "SESSION_ID": thread_id,
-                "error": collector.turn_error.get("message", "Turn 执行失败"),
-                "error_details": collector.turn_error,
-            }
+            partial = build_result_structured(
+                collector,
+                detail="compact",
+            )
+            return build_error_result(
+                collector.turn_error.get("message", "Turn 执行失败"),
+                thread_id=thread_id,
+                details={
+                    "status": partial["status"],
+                    "transport": partial["transport"],
+                    "diagnostics": partial["diagnostics"],
+                    "partial_result": partial["final_result"],
+                    "error_details": collector.turn_error,
+                },
+            )
 
         # 7. 聚合返回
-        aggregated = collector.get_aggregated_result()
-        status_payload = _build_status_payload(
-            collector,
-            cursor=0,
-            raw_events=False,
-        )
-        result: Dict[str, Any] = {
-            "success": True,
-            "SESSION_ID": thread_id,
-            "agent_messages": aggregated["agent_messages"],
-            "token_usage": aggregated["token_usage"],
-            "completed": status_payload["completed"],
-            "has_error": status_payload["has_error"],
-            "status": status_payload["status"],
-            "next_cursor": status_payload["next_cursor"],
-            "transport": status_payload["transport"],
-            "diagnostics": status_payload["diagnostics"],
-            "final_result": aggregated,
-        }
-        if status_payload["status"] == "transport_lost":
-            result["message"] = "app-server 传输已断开，返回当前已聚合结果。"
-
+        extra: dict[str, Any] = {}
+        if collector.completion_state == "transport_lost":
+            extra["message"] = "app-server 传输已断开，返回当前已聚合结果。"
         if return_all_messages:
-            # events 作为兼容字段，只保留生命周期摘要，不再包含 delta 碎片
-            # 原始事件级排障请使用非阻塞模式 codex_status(raw_events=True)
-            result["events"] = [
-                {"method": evt["method"], "summary": evt["summary"]}
-                for evt in status_payload["lifecycle_events"]
-            ]
-            result["changed_items"] = status_payload["changed_items"]
-            result["lifecycle_events"] = status_payload["lifecycle_events"]
-            result["diagnostic_events"] = status_payload["diagnostic_events"]
-            result["command_executions"] = aggregated["command_executions"]
-            result["file_changes"] = aggregated["file_changes"]
-            result["reasoning_segments"] = aggregated["reasoning_segments"]
+            status_payload = _build_status_payload(
+                collector,
+                cursor=0,
+                raw_events=False,
+                detail="verbose",
+            )
+            extra["status_snapshot"] = status_payload
+            extra["changed_items"] = status_payload["changed_items"]
+            extra["lifecycle_events"] = status_payload["lifecycle_events"]
+            extra["diagnostic_events"] = status_payload["diagnostic_events"]
+            extra["pending_approvals"] = status_payload["pending_approvals"]
+            if "new_events" in status_payload:
+                extra["raw_events"] = status_payload["new_events"]
 
+        result = _render_result_result(
+            collector,
+            detail="compact",
+            extra=extra,
+        )
         if collector.truncated:
-            result["truncated"] = True
+            result.structuredContent["truncated"] = True
 
         return result
 
@@ -315,12 +360,12 @@ async def codex(
         # 清理 placeholder（如果还存在）
         bridge.remove_collector(placeholder_id)
         logger.error(f"codex 工具执行失败: {e}")
-        return {"success": False, "error": str(e)}
+        return build_error_result(str(e))
 
 
 @mcp.tool(
     name="codex_start",
-    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
+    structured_output=False,  # 普通小型 dict 返回保持非结构化模式，避免自动推导输出模型
     description="""
     启动非阻塞 Codex 会话，立即返回 thread_id。
 
@@ -419,7 +464,7 @@ async def codex_start(
 
 @mcp.tool(
     name="codex_status",
-    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
+    structured_output=False,  # 显式返回 CallToolResult，避免普通 dict 被自动转为 JSON 文本
     description="""
     查询正在运行的 Codex 任务的增量状态。
 
@@ -428,8 +473,7 @@ async def codex_start(
 
     默认返回 Item 级快照（changed_items / lifecycle_events / diagnostic_events）。
     如需排障，可传 raw_events=true 保留原始 new_events。
-
-    当 completed=true 时，final_result 包含聚合输出。
+    完成态只返回紧凑 final_result 摘要；完整最终结果请使用 codex_result。
     当 pending_approvals 非空时，使用 codex_approve 响应审批请求。
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
@@ -438,27 +482,29 @@ async def codex_status(
     thread_id: str,
     cursor: int = 0,
     raw_events: bool = False,
-) -> Dict[str, Any]:
+    detail: Literal["compact", "verbose"] = "compact",
+) -> CallToolResult:
     """查询 Codex 任务的增量状态。"""
     bridge = get_bridge()
     collector = bridge.get_collector(thread_id)
 
     if collector is None:
-        return {
-            "success": False,
-            "error": f"未找到 thread_id: {thread_id}",
-        }
+        return build_error_result(
+            f"未找到 thread_id: {thread_id}",
+            thread_id=thread_id,
+        )
 
-    return _build_status_payload(
+    return _render_status_result(
         collector,
         cursor=cursor,
         raw_events=raw_events,
+        detail=detail,
     )
 
 
 @mcp.tool(
     name="codex_interrupt",
-    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
+    structured_output=False,  # 普通小型 dict 返回保持非结构化模式，避免自动推导输出模型
     description="""
     中断正在运行的 Codex 任务。
 
@@ -491,8 +537,75 @@ async def codex_interrupt(
 
 
 @mcp.tool(
+    name="codex_result",
+    structured_output=False,  # 显式返回 CallToolResult，避免普通 dict 被自动转为 JSON 文本
+    description="""
+    获取已完成 Codex 任务的最终聚合结果。
+
+    `detail="compact"` 返回适合阅读的紧凑结果，
+    `detail="full"` 返回完整结构化结果。
+    任务仍在运行时会返回错误，请先使用 codex_status 查看进度。
+    """,
+    meta={"version": "2.0.0", "author": "phaseddd"},
+)
+async def codex_result(
+    thread_id: str,
+    detail: Literal["compact", "full"] = "compact",
+    include_raw_events: bool = False,
+) -> CallToolResult:
+    """获取已完成任务的最终结果。"""
+    bridge = get_bridge()
+    collector = bridge.get_collector(thread_id)
+
+    if collector is None:
+        return build_error_result(
+            f"未找到 thread_id: {thread_id}",
+            thread_id=thread_id,
+        )
+
+    if not collector.is_completed():
+        return build_error_result(
+            (
+                "thread 尚未完成（当前状态："
+                f"{collector.completion_state}），请先用 codex_status 确认完成后再调用 codex_result。"
+            ),
+            thread_id=thread_id,
+            details={"status": collector.completion_state},
+        )
+
+    if collector.turn_error:
+        partial = build_result_structured(
+            collector,
+            detail="compact",
+            include_raw_events=include_raw_events,
+        )
+        return build_error_result(
+            collector.turn_error.get("message", "Turn 执行失败"),
+            thread_id=thread_id,
+            details={
+                "status": partial["status"],
+                "transport": partial["transport"],
+                "diagnostics": partial["diagnostics"],
+                "partial_result": partial["final_result"],
+                "error_details": collector.turn_error,
+            },
+        )
+
+    extra: dict[str, Any] = {}
+    if collector.completion_state == "transport_lost":
+        extra["message"] = "app-server 传输已断开，返回当前已聚合结果。"
+
+    return _render_result_result(
+        collector,
+        detail=detail,
+        include_raw_events=include_raw_events,
+        extra=extra,
+    )
+
+
+@mcp.tool(
     name="codex_approve",
-    structured_output=False,  # 阻止 FastMCP 自动生成 structuredContent，避免 Claude Code 换行符渲染异常
+    structured_output=False,  # 普通小型 dict 返回保持非结构化模式，避免自动推导输出模型
     description="""
     响应 Codex 的审批请求。
 
