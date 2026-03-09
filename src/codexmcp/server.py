@@ -141,7 +141,7 @@ def _build_turn_params(
     **使用建议：**
         - 确保 `cd` 路径存在且可访问。
         - 大多数场景推荐使用 "read-only" 沙箱以避免意外修改。
-        - 设置 `return_all_messages=True` 可获取完整事件摘要（仅 summary，不含原始 params）。
+        - 设置 `return_all_messages=True` 可获取详细结果（生命周期事件 + 命令执行 + 文件变更 + 推理过程）。
         - 长时间任务建议使用 codex_start 非阻塞模式。
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
@@ -292,11 +292,12 @@ async def codex(
         if status_payload["status"] == "transport_lost":
             result["message"] = "app-server 传输已断开，返回当前已聚合结果。"
 
-        # 可选：返回事件摘要（仅 summary，不含 params，避免撑爆上下文）
         if return_all_messages:
+            # events 作为兼容字段，只保留生命周期摘要，不再包含 delta 碎片
+            # 原始事件级排障请使用非阻塞模式 codex_status(raw_events=True)
             result["events"] = [
-                {"method": e.method, "summary": e.summary}
-                for e in collector.events
+                {"method": evt["method"], "summary": evt["summary"]}
+                for evt in status_payload["lifecycle_events"]
             ]
             result["changed_items"] = status_payload["changed_items"]
             result["lifecycle_events"] = status_payload["lifecycle_events"]

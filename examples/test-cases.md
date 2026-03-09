@@ -75,7 +75,7 @@
 - [ ] `success` === `true`
 - [ ] `agent_messages` 描述了 CSI 处理管线（预处理 → 特征提取 → 人体检测）
 - [ ] `events` 数组存在且非空（return_all_messages 生效）
-- [ ] `events` 中包含 `item/started`、`item/agentMessage/delta`、`item/completed` 等方法
+- [ ] `events` 中只包含生命周期事件（如 `turn/started`、`item/started`、`item/completed`、`turn/completed`），不包含 delta 碎片
 - [ ] `command_executions` 数组存在（Codex 执行了文件读取命令）
 - [ ] `token_usage` 包含有效的 token 计数
 
