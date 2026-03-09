@@ -25,7 +25,7 @@ from uuid import uuid4
 from mcp.server.fastmcp import Context, FastMCP
 
 from codexmcp.bridge import get_bridge
-from codexmcp.compat import escape_prompt
+from codexmcp.compat import IS_WINDOWS  # noqa: F401 — 保留平台检测常量供外部使用
 from codexmcp.errors import TURN_TOTAL_TIMEOUT
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ def _build_turn_params(
 
     Args:
         thread_id: 目标 thread ID
-        prompt: 已转义的 prompt 字符串
+        prompt: 原始 prompt 字符串（JSON 转义由 bridge.rpc_call 内的 json.dumps 自动处理）
         sandbox: 沙箱策略字符串（read-only / workspace-write / danger-full-access）
         images: 可选的图片列表
         yolo: 是否启用自动审批
@@ -179,8 +179,21 @@ async def codex(
             "error": f"工作目录不存在: {cd}",
         }
 
-    # Windows 平台 prompt 转义
-    PROMPT = escape_prompt(PROMPT)
+    # Windows 平台 prompt 转义已移除：json.dumps 会自动处理 JSON 转义，
+    # escape_prompt 会导致双重转义（\n 变成字面 \\n）
+
+    # 快速失败：检查已断连的会话
+    if SESSION_ID:
+        existing = bridge.get_collector(SESSION_ID)
+        if existing and existing.transport_disconnected:
+            return {
+                "success": False,
+                "error": (
+                    f"会话已丢失（{existing.disconnect_reason}），"
+                    "进程重启后无法恢复。请不带 SESSION_ID 启动新会话。"
+                ),
+                "SESSION_ID": SESSION_ID,
+            }
 
     # 1. 预创建 collector（防止通知早于响应到达时丢失）
     placeholder_id = f"__pending_{uuid4().hex[:8]}"
@@ -338,8 +351,20 @@ async def codex_start(
             "error": f"工作目录不存在: {cd}",
         }
 
-    # Windows 平台 prompt 转义
-    PROMPT = escape_prompt(PROMPT)
+    # Windows 平台 prompt 转义已移除：json.dumps 会自动处理 JSON 转义
+
+    # 快速失败：检查已断连的会话
+    if SESSION_ID:
+        existing = bridge.get_collector(SESSION_ID)
+        if existing and existing.transport_disconnected:
+            return {
+                "success": False,
+                "error": (
+                    f"会话已丢失（{existing.disconnect_reason}），"
+                    "进程重启后无法恢复。请不带 SESSION_ID 启动新会话。"
+                ),
+                "SESSION_ID": SESSION_ID,
+            }
 
     # 预创建 collector
     placeholder_id = f"__pending_{uuid4().hex[:8]}"

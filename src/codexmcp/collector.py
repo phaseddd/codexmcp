@@ -38,6 +38,16 @@ class EventCollector:
         auto_approve: yolo 模式标志
     """
 
+    @staticmethod
+    def _normalize_newlines(text: str) -> str:
+        """规范化换行符：\r\n → \n，孤立 \r → \n。
+
+        Codex app-server 在 Windows 上返回的 commandExecution 输出
+        包含 CRLF 换行，原样塞入 JSON 会导致 Claude Code 渲染异常
+        （\r\n 被当作字面文本而非换行）。
+        """
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
     # 资源治理安全阀
     MAX_EVENTS_PER_THREAD = 10000  # 单个 thread 最多存储事件数
     MAX_THREADS = 50  # 全局最多同时跟踪 thread 数（在 bridge 中检查）
@@ -230,14 +240,16 @@ class EventCollector:
 
             if item.item_type == "agentMessage":
                 if item.content_buffer:
-                    agent_messages.append(item.content_buffer)
+                    agent_messages.append(
+                        self._normalize_newlines(item.content_buffer)
+                    )
             elif item.item_type == "commandExecution":
                 command_executions.append(
                     {
                         "id": item.item_id,
                         "command": metadata.get("command", []),
                         "status": status,
-                        "output": item.content_buffer,
+                        "output": self._normalize_newlines(item.content_buffer),
                         "exit_code": metadata.get("exitCode"),
                         "duration_ms": metadata.get("durationMs"),
                     }
@@ -253,7 +265,9 @@ class EventCollector:
                 if path:
                     file_change["path"] = path
                 if item.content_buffer:
-                    file_change["diff_summary"] = item.content_buffer
+                    file_change["diff_summary"] = self._normalize_newlines(
+                        item.content_buffer
+                    )
                 file_changes.append(file_change)
             elif item.item_type == "reasoning":
                 reasoning_segment: dict[str, Any] = {
@@ -261,9 +275,13 @@ class EventCollector:
                     "status": status,
                 }
                 if item.reasoning_summary:
-                    reasoning_segment["summary"] = item.reasoning_summary
+                    reasoning_segment["summary"] = self._normalize_newlines(
+                        item.reasoning_summary
+                    )
                 if item.reasoning_text:
-                    reasoning_segment["text"] = item.reasoning_text
+                    reasoning_segment["text"] = self._normalize_newlines(
+                        item.reasoning_text
+                    )
                 if len(reasoning_segment) > 2:
                     reasoning_segments.append(reasoning_segment)
 
@@ -535,7 +553,7 @@ class EventCollector:
             if change["reasoning_text_delta"]:
                 delta["text"] = change["reasoning_text_delta"]
             return delta
-        return change["content_delta"]
+        return self._normalize_newlines(change["content_delta"])
 
     def _build_item_content(self, item: ItemState) -> str | dict[str, str]:
         if item.item_type == "reasoning":
@@ -545,7 +563,7 @@ class EventCollector:
             if item.reasoning_text:
                 content["text"] = item.reasoning_text
             return content
-        return item.content_buffer
+        return self._normalize_newlines(item.content_buffer)
 
     def _merge_dicts(
         self, base: dict[str, Any], override: dict[str, Any]

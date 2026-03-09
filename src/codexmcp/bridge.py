@@ -36,6 +36,12 @@ from codexmcp.errors import (
 )
 from codexmcp.process import build_app_server_cmd
 
+# stdout StreamReader 缓冲区限制
+# 默认 64KB 不足以容纳大型 JSONL 行（如包含完整文件内容的 commandExecution 输出），
+# 超限会触发 ValueError("Separator is found, but chunk is longer than limit")
+# 导致 _read_loop 异常退出（transport_lost）
+_STREAM_READER_LIMIT = 16 * 1024 * 1024  # 16MB
+
 logger = logging.getLogger(__name__)
 
 
@@ -123,6 +129,7 @@ class AppServerBridge:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_READER_LIMIT,
             **({"env": env} if env is not None else {}),
         )
         logger.info(f"app-server 进程已启动 PID={self._process.pid}")
