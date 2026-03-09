@@ -92,7 +92,7 @@ def _render_status_result(
 def _render_result_result(
     collector: Any,
     *,
-    detail: Literal["compact", "full"] = "compact",
+    detail: Literal["compact", "full", "raw"] = "compact",
     include_raw_events: bool = False,
     extra: dict[str, Any] | None = None,
 ) -> CallToolResult:
@@ -543,14 +543,15 @@ async def codex_interrupt(
     获取已完成 Codex 任务的最终聚合结果。
 
     `detail="compact"` 返回适合阅读的紧凑结果，
-    `detail="full"` 返回完整结构化结果。
+    `detail="full"` 返回完整可读结果，
+    `detail="raw"` 返回不做 ANSI 清洗的原始完整结果。
     任务仍在运行时会返回错误，请先使用 codex_status 查看进度。
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
 )
 async def codex_result(
     thread_id: str,
-    detail: Literal["compact", "full"] = "compact",
+    detail: Literal["compact", "full", "raw"] = "compact",
     include_raw_events: bool = False,
 ) -> CallToolResult:
     """获取已完成任务的最终结果。"""

@@ -270,6 +270,9 @@ class ReadyBridge:
     async def ensure_ready(self) -> None:
         return None
 
+    def get_collector(self, thread_id: str) -> EventCollector | None:
+        return None
+
 
 class FakeContext:
     async def report_progress(self, **_: int) -> None:
@@ -357,6 +360,80 @@ class BlockingBridge:
         raise AssertionError(f"未预期的 rpc_call: {method}")
 
 
+class StartBridge:
+    def __init__(self) -> None:
+        self._collectors: dict[str, EventCollector] = {}
+
+    async def ensure_ready(self) -> None:
+        return None
+
+    def get_collector(self, thread_id: str) -> EventCollector | None:
+        return self._collectors.get(thread_id)
+
+    def get_or_create_collector(self, thread_id: str) -> EventCollector:
+        collector = self._collectors.get(thread_id)
+        if collector is None:
+            collector = EventCollector(thread_id)
+            self._collectors[thread_id] = collector
+        return collector
+
+    def rebind_collector(self, old_thread_id: str, new_thread_id: str) -> None:
+        collector = self._collectors.pop(old_thread_id)
+        collector.thread_id = new_thread_id
+        self._collectors[new_thread_id] = collector
+
+    def remove_collector(self, thread_id: str) -> None:
+        self._collectors.pop(thread_id, None)
+
+    async def rpc_call(
+        self,
+        method: str,
+        params: dict[str, object],
+    ) -> dict[str, object]:
+        if method == "thread/start":
+            return {"thread": {"id": "thr_start"}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn_start"}}
+        raise AssertionError(f"未预期的 rpc_call: {method}")
+
+
+class InterruptBridge:
+    def __init__(self, collector: EventCollector | None) -> None:
+        self._collector = collector
+        self.interrupted: list[tuple[str, str | None]] = []
+
+    def get_collector(self, thread_id: str) -> EventCollector | None:
+        if self._collector and self._collector.thread_id == thread_id:
+            return self._collector
+        return None
+
+    async def interrupt_turn(
+        self,
+        thread_id: str,
+        turn_id: str | None,
+    ) -> dict[str, str | None]:
+        self.interrupted.append((thread_id, turn_id))
+        return {"thread_id": thread_id, "turn_id": turn_id}
+
+
+class ApproveBridge:
+    def __init__(self, collector: EventCollector | None) -> None:
+        self._collector = collector
+        self.responses: list[tuple[int, dict[str, object]]] = []
+
+    def get_collector(self, thread_id: str) -> EventCollector | None:
+        if self._collector and self._collector.thread_id == thread_id:
+            return self._collector
+        return None
+
+    async def send_response(
+        self,
+        request_id: int,
+        payload: dict[str, object],
+    ) -> None:
+        self.responses.append((request_id, payload))
+
+
 @pytest.fixture
 def completed_collector() -> EventCollector:
     return build_completed_collector()
@@ -410,3 +487,18 @@ def ready_bridge_factory():
 @pytest.fixture
 def blocking_bridge_factory():
     return BlockingBridge
+
+
+@pytest.fixture
+def start_bridge_factory():
+    return StartBridge
+
+
+@pytest.fixture
+def interrupt_bridge_factory():
+    return InterruptBridge
+
+
+@pytest.fixture
+def approve_bridge_factory():
+    return ApproveBridge

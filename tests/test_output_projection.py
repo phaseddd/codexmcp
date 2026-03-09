@@ -85,6 +85,24 @@ def test_build_result_structured_compact_truncates_command_output(
     assert execution["output_original_len"] > len(execution["output"])
 
 
+def test_build_result_structured_projects_raw_events_when_requested(
+    large_output_collector: EventCollector,
+) -> None:
+    structured = build_result_structured(
+        large_output_collector,
+        detail="compact",
+        include_raw_events=True,
+    )
+
+    output_event = next(
+        event
+        for event in structured["raw_events"]
+        if event["method"] == "item/commandExecution/outputDelta"
+    )
+    assert output_event["params"]["delta_truncated"] is True
+    assert len(output_event["params"]["delta"]) < output_event["params"]["delta_original_len"]
+
+
 def test_build_result_structured_full_keeps_full_command_output(
     large_output_collector: EventCollector,
 ) -> None:
@@ -96,6 +114,23 @@ def test_build_result_structured_full_keeps_full_command_output(
 
     assert execution["output"].startswith("HEAD\n")
     assert execution["output"].endswith("\nTAIL\n")
+    assert "\x1b" not in execution["output"]
+    assert execution.get("output_truncated") is not True
+
+
+def test_build_result_structured_raw_keeps_original_ansi(
+    large_output_collector: EventCollector,
+) -> None:
+    collector = large_output_collector
+    collector.items["cmd_1"].content_buffer = "\x1b[31mHEAD\x1b[0m\nBODY\nTAIL\n"
+
+    structured = build_result_structured(
+        collector,
+        detail="raw",
+    )
+    execution = structured["final_result"]["command_executions"][0]
+
+    assert "\x1b[31m" in execution["output"]
     assert execution.get("output_truncated") is not True
 
 

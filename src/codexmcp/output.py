@@ -13,6 +13,7 @@ ViewMode = Literal[
     "status_verbose",
     "result_compact",
     "result_full",
+    "result_raw",
 ]
 
 MAX_COMMAND_OUTPUT_PREVIEW = 2000
@@ -246,7 +247,7 @@ def _project_raw_event(event: dict[str, Any]) -> dict[str, Any]:
 def _project_command_execution(
     execution: dict[str, Any],
     *,
-    detail: Literal["compact", "full"],
+    detail: Literal["compact", "full", "raw"],
 ) -> dict[str, Any]:
     projected = dict(execution)
     if detail == "compact":
@@ -256,38 +257,37 @@ def _project_command_execution(
             limit=MAX_COMMAND_OUTPUT_PREVIEW,
             strip_ansi_codes=True,
         )
-    else:
+    elif detail == "full":
         output = projected.get("output")
         if isinstance(output, str):
-            preview = preview_text(
-                output,
-                limit=len(output),
-                strip_ansi_codes=True,
-            )
-            _add_preview_metadata(projected, "output", preview)
+            projected["output"] = strip_ansi(_normalize_newlines(output))
     return projected
 
 
 def _project_file_change(
     file_change: dict[str, Any],
     *,
-    detail: Literal["compact", "full"],
+    detail: Literal["compact", "full", "raw"],
 ) -> dict[str, Any]:
     projected = dict(file_change)
     if "diff_summary" in projected:
-        limit = (
-            MAX_FILE_DIFF_PREVIEW
-            if detail == "compact"
-            else max(len(str(projected["diff_summary"])), 1)
-        )
-        _preview_plain_field(projected, "diff_summary", limit=limit)
+        if detail == "compact":
+            _preview_plain_field(
+                projected,
+                "diff_summary",
+                limit=MAX_FILE_DIFF_PREVIEW,
+            )
+        elif isinstance(projected.get("diff_summary"), str):
+            projected["diff_summary"] = _normalize_newlines(
+                projected["diff_summary"]
+            )
     return projected
 
 
 def _project_reasoning_segment(
     reasoning: dict[str, Any],
     *,
-    detail: Literal["compact", "full"],
+    detail: Literal["compact", "full", "raw"],
 ) -> dict[str, Any]:
     projected = dict(reasoning)
     if detail == "compact" and isinstance(projected.get("text"), str):
@@ -296,7 +296,7 @@ def _project_reasoning_segment(
             limit=MAX_REASONING_TEXT_PREVIEW,
         )
         _add_preview_metadata(projected, "text", preview)
-    elif detail == "full" and isinstance(projected.get("text"), str):
+    elif detail in {"full", "raw"} and isinstance(projected.get("text"), str):
         projected["text"] = _normalize_newlines(projected["text"])
     if isinstance(projected.get("summary"), str):
         projected["summary"] = _normalize_newlines(projected["summary"])
@@ -418,7 +418,7 @@ def build_status_content(structured: dict[str, Any]) -> list[str]:
 def build_result_structured(
     collector: Any,
     *,
-    detail: Literal["compact", "full"] = "compact",
+    detail: Literal["compact", "full", "raw"] = "compact",
     include_raw_events: bool = False,
 ) -> dict[str, Any]:
     """构造 codex_result / codex 的结构化结果。"""
@@ -464,7 +464,10 @@ def build_result_structured(
             raw_events=True,
             view="verbose",
         )
-        structured["raw_events"] = raw_status.get("new_events", [])
+        structured["raw_events"] = [
+            _project_raw_event(event)
+            for event in raw_status.get("new_events", [])
+        ]
     return structured
 
 
