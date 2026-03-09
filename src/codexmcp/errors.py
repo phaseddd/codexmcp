@@ -49,13 +49,3 @@ class AppServerNotReady(Exception):
     """
 
     pass
-
-
-class TurnTimeoutError(Exception):
-    """Turn 执行超时。
-
-    当 Turn 执行时间超过 TURN_TOTAL_TIMEOUT 时抛出，
-    通常伴随自动中断操作。
-    """
-
-    pass

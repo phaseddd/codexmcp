@@ -8,14 +8,6 @@ from typing import Any, Literal, TypedDict
 
 from mcp.types import CallToolResult, TextContent
 
-ViewMode = Literal[
-    "status_compact",
-    "status_verbose",
-    "result_compact",
-    "result_full",
-    "result_raw",
-]
-
 MAX_COMMAND_OUTPUT_PREVIEW = 2000
 MAX_FILE_DIFF_PREVIEW = 2000
 MAX_REASONING_TEXT_PREVIEW = 1500

@@ -27,7 +27,6 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult
 
 from codexmcp.bridge import get_bridge
-from codexmcp.compat import IS_WINDOWS  # noqa: F401 — 保留平台检测常量供外部使用
 from codexmcp.errors import TURN_TOTAL_TIMEOUT
 from codexmcp.output import (
     build_call_tool_result,
@@ -221,8 +220,7 @@ async def codex(
     if not cd.exists():
         return build_error_result(f"工作目录不存在: {cd}")
 
-    # Windows 平台 prompt 转义已移除：json.dumps 会自动处理 JSON 转义，
-    # escape_prompt 会导致双重转义（\n 变成字面 \\n）
+    # prompt 无需平台专用转义：json.dumps 会自动处理 JSON 转义
 
     # 快速失败：检查已断连的会话
     if SESSION_ID:
@@ -397,7 +395,7 @@ async def codex_start(
             "error": f"工作目录不存在: {cd}",
         }
 
-    # Windows 平台 prompt 转义已移除：json.dumps 会自动处理 JSON 转义
+    # prompt 无需平台专用转义：json.dumps 会自动处理 JSON 转义
 
     # 快速失败：检查已断连的会话
     if SESSION_ID:

@@ -18,9 +18,11 @@ import threading
 import time
 from typing import Callable
 
-from codexmcp.compat import IS_WINDOWS
-
 logger = logging.getLogger(__name__)
+
+
+# 平台检测常量：平台相关逻辑集中保留在本模块
+IS_WINDOWS: bool = os.name == "nt"
 
 
 # === 原生二进制直接解析（跨平台） ===
@@ -68,15 +70,6 @@ _PLATFORM_TARGETS: dict[tuple[str, str], dict[str, str]] = {
         "package": "codex-win32-arm64",
     },
 }
-
-# 向后兼容：保留旧常量名，实际由单一事实表自动派生，避免双源漂移
-_TARGET_TRIPLES: dict[tuple[str, str], str] = {
-    key: value["triple"] for key, value in _PLATFORM_TARGETS.items()
-}
-_PLATFORM_PACKAGES: dict[str, str] = {
-    value["triple"]: value["package"] for value in _PLATFORM_TARGETS.values()
-}
-
 
 def _normalize_platform_arch() -> tuple[str, str, str, str]:
     """规范化平台与架构键，降低 platform.machine() 别名差异带来的失配。"""
