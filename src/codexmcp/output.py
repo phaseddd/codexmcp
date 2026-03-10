@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections import Counter
@@ -90,7 +91,7 @@ def build_call_tool_result(
     不使用 structuredContent 字段：Claude Code 在渲染时优先展示
     structuredContent 的 JSON 序列化结果，导致 content 中的 Markdown
     文本被忽略、换行符被 JSON 转义为字面量 \\n。
-    结构化数据改为以 JSON 文本块追加到 content 末尾（应急退路）。
+    结构化数据经瘦身后以紧凑 JSON 文本块追加到 content 末尾。
     """
 
     normalized_blocks: list[TextContent] = []
@@ -102,12 +103,13 @@ def build_call_tool_result(
                 TextContent(type="text", text=_normalize_newlines(block))
             )
 
-    # 结构化数据作为 JSON 文本块追加，而非设置 structuredContent
+    # 结构化数据经瘦身后作为紧凑 JSON 文本块追加
     if structured_content is not None:
+        slimmed = _slim_for_json_block(structured_content)
         normalized_blocks.append(
             TextContent(
                 type="text",
-                text=json.dumps(structured_content, ensure_ascii=False, indent=2),
+                text=json.dumps(slimmed, ensure_ascii=False),
             )
         )
 
@@ -116,6 +118,75 @@ def build_call_tool_result(
         structuredContent=None,
         isError=is_error,
     )
+
+
+def _slim_for_json_block(data: dict[str, Any]) -> dict[str, Any]:
+    """剥离结构化数据中与人读 Markdown 块重复的大文本字段。
+
+    json.dumps 会把字符串中的换行符转义为字面量 \\n，
+    已在 Markdown TextContent 中展示的大文本无需在 JSON 中重复。
+    只保留机读元数据（ID、状态、计数、token 用量等）。
+    """
+
+    slimmed = copy.deepcopy(data)
+
+    # === codex / codex_result 的 final_result 结构 ===
+    fr = slimmed.get("final_result")
+    if isinstance(fr, dict):
+        # agent 文本已在 Block 0 展示，不重复
+        fr.pop("agent_messages_text", None)
+        fr.pop("agent_message_items", None)
+
+        # 命令执行：保留元数据（id/command/status/exit_code/duration），剥离大文本输出
+        for cmd in fr.get("command_executions", []):
+            cmd.pop("output", None)
+            cmd.pop("output_truncated", None)
+            cmd.pop("output_original_len", None)
+            cmd.pop("output_ansi_stripped", None)
+
+        # 文件变更：保留路径和类型，剥离 diff 文本
+        for fc in fr.get("file_changes", []):
+            fc.pop("diff_summary", None)
+            fc.pop("diff_summary_truncated", None)
+            fc.pop("diff_summary_original_len", None)
+            # changes 数组内的 diff 也剥离
+            for change in fc.get("changes", []):
+                change.pop("diff", None)
+
+        # 推理段：保留 summary，剥离 text
+        for seg in fr.get("reasoning_segments", []):
+            seg.pop("text", None)
+            seg.pop("text_truncated", None)
+            seg.pop("text_original_len", None)
+
+    # === codex_status 的 changed_items 结构 ===
+    for item in slimmed.get("changed_items", []):
+        item.pop("delta", None)
+        item.pop("delta_truncated", None)
+        item.pop("delta_original_len", None)
+        item.pop("delta_ansi_stripped", None)
+        item.pop("content", None)
+        item.pop("content_truncated", None)
+        item.pop("content_original_len", None)
+        item.pop("content_ansi_stripped", None)
+
+    # === raw_events / new_events 中的 delta 参数 ===
+    for event in slimmed.get("new_events", []):
+        params = event.get("params")
+        if isinstance(params, dict):
+            params.pop("delta", None)
+            params.pop("delta_truncated", None)
+            params.pop("delta_original_len", None)
+            params.pop("delta_ansi_stripped", None)
+    for event in slimmed.get("raw_events", []):
+        params = event.get("params")
+        if isinstance(params, dict):
+            params.pop("delta", None)
+            params.pop("delta_truncated", None)
+            params.pop("delta_original_len", None)
+            params.pop("delta_ansi_stripped", None)
+
+    return slimmed
 
 
 def build_error_result(
