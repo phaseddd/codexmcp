@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from typing import Any, Literal, TypedDict
@@ -84,7 +85,13 @@ def build_call_tool_result(
     *,
     is_error: bool = False,
 ) -> CallToolResult:
-    """统一构造 CallToolResult。"""
+    """统一构造 CallToolResult。
+
+    不使用 structuredContent 字段：Claude Code 在渲染时优先展示
+    structuredContent 的 JSON 序列化结果，导致 content 中的 Markdown
+    文本被忽略、换行符被 JSON 转义为字面量 \\n。
+    结构化数据改为以 JSON 文本块追加到 content 末尾（应急退路）。
+    """
 
     normalized_blocks: list[TextContent] = []
     for block in content_blocks:
@@ -95,9 +102,18 @@ def build_call_tool_result(
                 TextContent(type="text", text=_normalize_newlines(block))
             )
 
+    # 结构化数据作为 JSON 文本块追加，而非设置 structuredContent
+    if structured_content is not None:
+        normalized_blocks.append(
+            TextContent(
+                type="text",
+                text=json.dumps(structured_content, ensure_ascii=False, indent=2),
+            )
+        )
+
     return CallToolResult(
         content=normalized_blocks,
-        structuredContent=structured_content,
+        structuredContent=None,
         isError=is_error,
     )
 

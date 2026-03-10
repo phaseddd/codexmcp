@@ -344,13 +344,15 @@ async def codex(
             if "new_events" in status_payload:
                 extra["raw_events"] = status_payload["new_events"]
 
+        # 事件截断标记
+        if collector.truncated:
+            extra["truncated"] = True
+
         result = _render_result_result(
             collector,
             detail="compact",
             extra=extra,
         )
-        if collector.truncated:
-            result.structuredContent["truncated"] = True
 
         return result
 
