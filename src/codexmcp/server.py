@@ -29,10 +29,13 @@ from mcp.types import CallToolResult
 from codexmcp.bridge import get_bridge
 from codexmcp.errors import TURN_TOTAL_TIMEOUT
 from codexmcp.output import (
+    build_approve_content,
     build_call_tool_result,
     build_error_result,
+    build_interrupt_content,
     build_result_content,
     build_result_structured,
+    build_start_content,
     build_status_content,
     build_status_structured,
 )
@@ -385,17 +388,14 @@ async def codex_start(
     SESSION_ID: str = "",
     yolo: bool = False,
     image: list[Path] = [],
-) -> Dict[str, Any]:
+) -> CallToolResult:
     """非阻塞模式：启动 Codex 任务，立即返回 thread_id。"""
     bridge = get_bridge()
     await bridge.ensure_ready()
 
     # 路径预校验：在调用 app-server 前快速失败
     if not cd.exists():
-        return {
-            "success": False,
-            "error": f"工作目录不存在: {cd}",
-        }
+        return build_error_result(f"工作目录不存在: {cd}")
 
     # prompt 无需平台专用转义：json.dumps 会自动处理 JSON 转义
 
@@ -403,14 +403,13 @@ async def codex_start(
     if SESSION_ID:
         existing = bridge.get_collector(SESSION_ID)
         if existing and existing.transport_disconnected:
-            return {
-                "success": False,
-                "error": (
+            return build_error_result(
+                (
                     f"会话已丢失（{existing.disconnect_reason}），"
                     "进程重启后无法恢复。请不带 SESSION_ID 启动新会话。"
                 ),
-                "SESSION_ID": SESSION_ID,
-            }
+                thread_id=SESSION_ID,
+            )
 
     # 预创建 collector
     placeholder_id = f"__pending_{uuid4().hex[:8]}"
@@ -448,18 +447,21 @@ async def codex_start(
         turn_result = await bridge.rpc_call("turn/start", turn_params)
         collector.current_turn_id = turn_result.get("turn", {}).get("id")
 
-        return {
+        result_data = {
             "success": True,
             "thread_id": thread_id,
             "SESSION_ID": thread_id,  # 向后兼容别名
             "status": "running",
-            "message": "任务已启动。使用 codex_status(thread_id) 查看进度。",
         }
+        return build_call_tool_result(
+            build_start_content(result_data),
+            result_data,
+        )
 
     except Exception as e:
         bridge.remove_collector(placeholder_id)
         logger.error(f"codex_start 执行失败: {e}")
-        return {"success": False, "error": str(e)}
+        return build_error_result(str(e))
 
 
 @mcp.tool(
@@ -514,26 +516,40 @@ async def codex_status(
 )
 async def codex_interrupt(
     thread_id: str,
-) -> Dict[str, Any]:
+) -> CallToolResult:
     """中断正在进行的 Codex 任务。"""
     bridge = get_bridge()
     collector = bridge.get_collector(thread_id)
 
     if collector is None:
-        return {"success": False, "error": f"未找到 thread_id: {thread_id}"}
+        return build_error_result(
+            f"未找到 thread_id: {thread_id}",
+            thread_id=thread_id,
+        )
 
     if collector.is_completed():
-        return {"success": True, "message": "任务已经完成，无需中断。"}
+        data: Dict[str, Any] = {
+            "success": True,
+            "message": "任务已经完成，无需中断。",
+        }
+        return build_call_tool_result(
+            build_interrupt_content(data),
+            data,
+        )
 
     turn_id = collector.get_current_turn_id()
     if turn_id:
         await bridge.interrupt_turn(thread_id, turn_id)
 
-    return {
+    data = {
         "success": True,
         "message": "中断请求已发送。",
         "events_collected": len(collector.events),
     }
+    return build_call_tool_result(
+        build_interrupt_content(data),
+        data,
+    )
 
 
 @mcp.tool(
@@ -620,17 +636,23 @@ async def codex_approve(
     request_id: int,
     approve: bool = True,
     reason: str = "",
-) -> Dict[str, Any]:
+) -> CallToolResult:
     """响应 Codex 的审批请求。"""
     bridge = get_bridge()
     collector = bridge.get_collector(thread_id)
 
     if collector is None:
-        return {"success": False, "error": f"未找到 thread_id: {thread_id}"}
+        return build_error_result(
+            f"未找到 thread_id: {thread_id}",
+            thread_id=thread_id,
+        )
 
     # 检查审批请求是否存在
     if request_id not in collector.pending_approvals:
-        return {"success": False, "error": f"未找到审批请求: {request_id}"}
+        return build_error_result(
+            f"未找到审批请求: {request_id}",
+            thread_id=thread_id,
+        )
 
     # 发送审批响应给 app-server
     if approve:
@@ -662,11 +684,15 @@ async def codex_approve(
     # 清理已处理的审批请求
     del collector.pending_approvals[request_id]
 
-    return {
+    data: Dict[str, Any] = {
         "success": True,
         "message": f"审批请求 {request_id} 已{'批准' if approve else '拒绝'}。",
         "remaining_approvals": len(collector.pending_approvals),
     }
+    return build_call_tool_result(
+        build_approve_content(data),
+        data,
+    )
 
 
 # === 服务器启动 ===
