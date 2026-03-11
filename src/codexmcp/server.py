@@ -39,6 +39,7 @@ from codexmcp.output import (
     build_status_content,
     build_status_structured,
 )
+from codexmcp.recorder import record_result
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,7 @@ def _build_turn_params(
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
 )
+@record_result("codex")
 async def codex(
     PROMPT: str,
     cd: Path,
@@ -379,6 +381,7 @@ async def codex(
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
 )
+@record_result("codex_start")
 async def codex_start(
     PROMPT: str,
     cd: Path,
@@ -480,6 +483,7 @@ async def codex_start(
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
 )
+@record_result("codex_status")
 async def codex_status(
     thread_id: str,
     cursor: int = 0,
@@ -514,6 +518,7 @@ async def codex_status(
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
 )
+@record_result("codex_interrupt")
 async def codex_interrupt(
     thread_id: str,
 ) -> CallToolResult:
@@ -565,6 +570,7 @@ async def codex_interrupt(
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
 )
+@record_result("codex_result")
 async def codex_result(
     thread_id: str,
     detail: Literal["compact", "full", "raw"] = "compact",
@@ -631,6 +637,7 @@ async def codex_result(
     """,
     meta={"version": "2.0.0", "author": "phaseddd"},
 )
+@record_result("codex_approve")
 async def codex_approve(
     thread_id: str,
     request_id: int,

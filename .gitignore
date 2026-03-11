@@ -8,6 +8,7 @@ record-analysis/
 examples/results/*
 !examples/results/.gitkeep
 tmp/
+test-dumps/
 
 # Python
 __pycache__/

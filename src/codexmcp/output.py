@@ -105,6 +105,10 @@ def build_call_tool_result(
 
     # 结构化数据经瘦身后作为紧凑 JSON 文本块追加
     if structured_content is not None:
+        # 记录器暂存：在 slim 前保存原始结构化数据
+        from codexmcp.recorder import stash_pre_slim
+
+        stash_pre_slim(structured_content)
         slimmed = _slim_for_json_block(structured_content)
         normalized_blocks.append(
             TextContent(
