@@ -1,3 +1,0 @@
-# CodexMCP
-
-> README rewriting in progress...
