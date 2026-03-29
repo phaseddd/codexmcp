@@ -3,6 +3,7 @@ codexmcp-doc/
 .cache-openai-codex*/
 *CLAUDE.md
 /AGENTS.md
+.claude/
 _temp_commands/
 _temp_skills/
 record-analysis/
